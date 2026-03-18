@@ -1,0 +1,10 @@
+torch>=2.0.0
+torchvision
+numpy
+Pillow
+scipy
+open3d
+einops
+tqdm
+roma
+kornia
