@@ -14,6 +14,7 @@ from dust3r.model import AsymmetricCroCo3DStereo
 from dust3r.utils.image import load_images
 from dust3r.image_pairs import make_pairs
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+from mesh_reconstruction import clean_point_cloud
 
 def normalize_images(raw_data_dir: Path):
     print(f"--- Step 1: Normalizing images in {raw_data_dir} ---")
@@ -97,6 +98,10 @@ def run_dust3r(raw_data_dir: Path, output_dir: Path):
     
     o3d.io.write_point_cloud(str(ply_path), pcd)
     print(f"🎉 Success! 3D Point Cloud saved to {ply_path}")
+
+    cleaned_ply_path = output_dir / "reconstruction_clean.ply"
+    clean_point_cloud(ply_path, cleaned_ply_path)
+    print(f"🎉 Phase 2 Step 2.1 complete: cleaned point cloud saved to {cleaned_ply_path}")
 
 if __name__ == "__main__":
     project_root = Path(__file__).parent.parent.resolve()
