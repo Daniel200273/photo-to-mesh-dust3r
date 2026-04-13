@@ -3,3 +3,4 @@ data/raw_data_up/*
 data_book/
 dust3r/
 *.DS_Store
+data/processed_data/*
