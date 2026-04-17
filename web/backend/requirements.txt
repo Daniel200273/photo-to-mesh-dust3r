@@ -1,0 +1,7 @@
+fastapi>=0.115.0
+uvicorn>=0.24.0
+python-multipart>=0.0.18
+Pillow>=10.0.0
+plotly>=5.18.0
+# NOTE: torch, torchvision, numpy, open3d already in main .venv
+# Don't reinstall them to avoid version conflicts with existing packages

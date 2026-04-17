@@ -55,8 +55,17 @@ def load_model():
     if hasattr(torch.serialization, 'add_safe_globals'):
         torch.serialization.add_safe_globals([argparse.Namespace])
 
-    model_path = "dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
-    model = AsymmetricCroCo3DStereo.from_pretrained(model_path).to(device)
+    model_path = Path(__file__).parent.parent / "dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+    
+    # Load local model file if it exists, otherwise try HuggingFace
+    if model_path.exists():
+        print(f"Loading model from local cache: {model_path}")
+        model = AsymmetricCroCo3DStereo.from_pretrained(str(model_path), local_files_only=True).to(device)
+    else:
+        print(f"Model not found locally at {model_path}")
+        print("Downloading from HuggingFace (this may take a while)...")
+        model = AsymmetricCroCo3DStereo.from_pretrained("naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt").to(device)
+    
     model.eval()
 
     return model, device
