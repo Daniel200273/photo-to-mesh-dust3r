@@ -1,18 +1,17 @@
 """
-mesh_reconstruction.py — Modular 3D Reconstruction Pipeline
+mesh_reconstruction.py — 3D Reconstruction Pipeline
 
-Supports two workflows:
-  1. Single-scan:  one point cloud → cleaned mesh
-  2. Two-pass:     two scans (top + flipped bottom) → registered, merged, meshed
+Workflow:
+  Point cloud → clean → mesh → auto-pedestal
 
 Architecture:
-  clean_cloud()      — SOR + RANSAC plane removal + DBSCAN object isolation
-  register_clouds()  — FPFH global registration + Point-to-Plane ICP refinement
-  generate_mesh()    — Poisson reconstruction + distance trim + hole fill + color transfer
+  clean_cloud()       — SOR + RANSAC plane removal + DBSCAN object isolation
+  generate_mesh()     — Poisson reconstruction + density/distance trim + hole fill + color transfer
+  generate_pedestal() — auto-sized flat disc placed at the object's base
+  run_pipeline()      — orchestrates the full workflow
 
 Usage:
   python mesh_reconstruction.py --input cloud.ply --output mesh/
-  python mesh_reconstruction.py --scan_a top.ply --scan_b bottom.ply --output mesh/
 """
 
 import argparse
@@ -20,7 +19,6 @@ import numpy as np
 import open3d as o3d
 import trimesh
 from pathlib import Path
-import copy
 
 
 # ═══════════════════════════ PARAMETERS ══════════════════════════════════════
@@ -40,26 +38,18 @@ CLUSTER_EPS        = 0.05
 CLUSTER_MIN_POINTS = 10
 CLUSTER_VOXEL_SIZE = 0.005
 
-# Registration — Feature Extraction
-REG_VOXEL_SIZE   = 0.005
-REG_FPFH_RADIUS  = 0.025
-REG_FPFH_MAX_NN  = 100
-
-# Registration — Global (FPFH + RANSAC)
-REG_RANSAC_DISTANCE        = 0.015
-REG_RANSAC_MAX_ITERATIONS  = 4_000_000
-REG_RANSAC_CONFIDENCE      = 0.999
-
-# Registration — Local (ICP)
-REG_ICP_DISTANCE  = 0.01
-REG_ICP_MAX_ITER  = 200
-
 # Mesher — Poisson Surface Reconstruction
 POISSON_DEPTH          = 9
 POISSON_TRIM_DISTANCE  = 0.02
 
 # Mesher — Color Transfer
 COLOR_KNN = 1
+
+# Pedestal
+PEDESTAL_PADDING       = 1.15   # pedestal radius = bounding radius × this factor
+PEDESTAL_THICKNESS     = 0.005  # thin slab height
+PEDESTAL_RESOLUTION    = 128    # angular subdivisions for the disc
+PEDESTAL_COLOR_SAMPLES = 64     # bottom-edge vertices to sample for colour matching
 
 
 # ═══════════════════════════ MODULE 1: CLEANSER ══════════════════════════════
@@ -144,7 +134,7 @@ def clean_cloud(
 
     if num_clusters == 0:
         print("    ⚠️  No clusters — returning full cloud")
-        return pcd
+        return pcd, plane_model
 
     largest = np.argmax(np.bincount(labels[labels >= 0]))
     pcd_down_main = pcd_down.select_by_index(np.where(labels == largest)[0])
@@ -165,111 +155,10 @@ def clean_cloud(
     if save_dir:
         o3d.io.write_point_cloud(str(save_dir / "03_object.ply"), pcd)
 
-    return pcd
+    return pcd, plane_model
 
 
-# ═══════════════════════════ MODULE 2: STITCHER ══════════════════════════════
-
-def _compute_fpfh(pcd: o3d.geometry.PointCloud, voxel_size: float):
-    """Downsample, estimate normals, and compute FPFH features."""
-    pcd_down = pcd.voxel_down_sample(voxel_size)
-    pcd_down.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=voxel_size * 2, max_nn=30,
-        )
-    )
-    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-        pcd_down,
-        o3d.geometry.KDTreeSearchParamHybrid(
-            radius=REG_FPFH_RADIUS, max_nn=REG_FPFH_MAX_NN,
-        ),
-    )
-    return pcd_down, fpfh
-
-
-def register_clouds(
-    source: o3d.geometry.PointCloud,
-    target: o3d.geometry.PointCloud,
-    output_dir: Path | None = None,
-) -> tuple[np.ndarray, o3d.geometry.PointCloud]:
-    """
-    Align source (Scan B / bottom) onto target (Scan A / top).
-
-    1. FPFH feature extraction on both clouds
-    2. Global registration via RANSAC on FPFH correspondences
-    3. Local refinement via Point-to-Plane ICP
-
-    Returns:
-      transformation: 4×4 matrix that brings source into target's frame
-      source_aligned: transformed source cloud
-    """
-    print(f"\n{'='*60}")
-    print(f"  STITCHER — Global + Local Registration")
-    print(f"{'='*60}")
-
-    # ── FPFH Features ────────────────────────────────────────────────────
-    print("\n  Computing FPFH features …")
-    source_down, source_fpfh = _compute_fpfh(source, REG_VOXEL_SIZE)
-    target_down, target_fpfh = _compute_fpfh(target, REG_VOXEL_SIZE)
-    print(f"    Source: {len(source_down.points):,} keypoints")
-    print(f"    Target: {len(target_down.points):,} keypoints")
-
-    # ── Global Registration (RANSAC) ─────────────────────────────────────
-    print("\n  Global Registration (FPFH + RANSAC) …")
-    checkers = [
-        o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-        o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(REG_RANSAC_DISTANCE),
-    ]
-    global_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-        source_down, target_down,
-        source_fpfh, target_fpfh,
-        mutual_filter=True,
-        max_correspondence_distance=REG_RANSAC_DISTANCE,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
-        ransac_n=3,
-        checkers=checkers,
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
-            REG_RANSAC_MAX_ITERATIONS, REG_RANSAC_CONFIDENCE,
-        ),
-    )
-    print(f"    Fitness:  {global_result.fitness:.4f}")
-    print(f"    RMSE:     {global_result.inlier_rmse:.6f}")
-
-    # ── Local Refinement (Point-to-Plane ICP) ────────────────────────────
-    print("\n  Local Refinement (Point-to-Plane ICP) …")
-    source_down.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=REG_VOXEL_SIZE * 2, max_nn=30,
-        )
-    )
-    target_down.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=REG_VOXEL_SIZE * 2, max_nn=30,
-        )
-    )
-
-    icp_result = o3d.pipelines.registration.registration_icp(
-        source_down, target_down,
-        REG_ICP_DISTANCE,
-        init=global_result.transformation,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=REG_ICP_MAX_ITER),
-    )
-    print(f"    Fitness:  {icp_result.fitness:.4f}")
-    print(f"    RMSE:     {icp_result.inlier_rmse:.6f}")
-
-    transformation = icp_result.transformation
-    source_aligned = copy.deepcopy(source)
-    source_aligned.transform(transformation)
-
-    if output_dir is not None:
-        o3d.io.write_point_cloud(str(output_dir / "scan_b_aligned.ply"), source_aligned)
-        np.save(str(output_dir / "registration_transform.npy"), transformation)
-
-    return transformation, source_aligned
-
-
-# ═══════════════════════════ MODULE 3: MESHER ════════════════════════════════
+# ═══════════════════════════ MODULE 2: MESHER ════════════════════════════════
 
 def generate_mesh(
     pcd: o3d.geometry.PointCloud,
@@ -277,7 +166,7 @@ def generate_mesh(
     output_dir: Path | None = None,
 ) -> o3d.geometry.TriangleMesh:
     """
-    Full meshing pipeline: Poisson reconstruction → distance trim →
+    Full meshing pipeline: Poisson reconstruction → density/distance trim →
     hole fill → vertex color transfer.
 
     Args:
@@ -292,12 +181,18 @@ def generate_mesh(
     print(f"  MESHER — Surface Reconstruction")
     print(f"{'='*60}")
 
-    # ── Normals ──────────────────────────────────────────────────────────
-    print("\n  Estimating normals …")
+    # ── Adaptive normal estimation ───────────────────────────────────────
+    print("\n  Estimating normals (density-adaptive radius) …")
+    nn_dists = np.asarray(pcd.compute_nearest_neighbor_distance())
+    avg_nn = np.mean(nn_dists)
+    normal_radius = max(avg_nn * 4.0, 0.01)
+    print(f"    Avg NN distance: {avg_nn:.5f}  →  normal radius: {normal_radius:.5f}")
     pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30),
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=normal_radius, max_nn=50,
+        ),
     )
-    pcd.orient_normals_consistent_tangent_plane(k=15)
+    pcd.orient_normals_consistent_tangent_plane(k=30)
 
     # ── Poisson Reconstruction ───────────────────────────────────────────
     print(f"  Poisson reconstruction (depth={POISSON_DEPTH}) …")
@@ -306,8 +201,16 @@ def generate_mesh(
     )
     print(f"    Raw: {len(mesh.vertices):,} verts, {len(mesh.triangles):,} tris")
 
+    # ── Density-based trimming ───────────────────────────────────────────
+    print(f"  Density-based trimming …")
+    density_arr = np.asarray(densities)
+    density_threshold = np.quantile(density_arr, 0.01)
+    density_mask = density_arr < density_threshold
+    mesh.remove_vertices_by_mask(density_mask)
+    print(f"    Removed {density_mask.sum():,} low-density vertices")
+
     # ── Distance-based Trimming ──────────────────────────────────────────
-    print(f"  Trimming (max dist={POISSON_TRIM_DISTANCE}) …")
+    print(f"  Distance-based trimming (max dist={POISSON_TRIM_DISTANCE}) …")
     pcd_tree = o3d.geometry.KDTreeFlann(pcd)
     verts = np.asarray(mesh.vertices)
     remove = np.zeros(len(verts), dtype=bool)
@@ -374,10 +277,143 @@ def generate_mesh(
     return mesh
 
 
-# ═══════════════════════════ PIPELINE ORCHESTRATORS ══════════════════════════
+# ═══════════════════════════ MODULE 3: PEDESTAL ══════════════════════════════
 
-def run_single_scan(input_ply: Path, output_dir: Path):
-    """Single-scan pipeline: clean → mesh."""
+def generate_pedestal(
+    mesh: o3d.geometry.TriangleMesh,
+    plane_model: tuple | None = None,
+    output_dir: Path | None = None,
+) -> o3d.geometry.TriangleMesh:
+    """
+    Generate a flat circular pedestal and attach it below the object.
+
+    If a RANSAC plane_model (a, b, c, d) is provided the disc is oriented
+    perpendicular to that plane's normal — which is the actual support
+    surface direction regardless of how the scan is rotated in space.
+    Falls back to Y-up if no plane model is given.
+
+    Returns: combined mesh (object + pedestal).
+    """
+    print(f"\n{'='*60}")
+    print(f"  PEDESTAL — Auto-Generated Base")
+    print(f"{'='*60}")
+
+    verts  = np.asarray(mesh.vertices)
+    colors = np.asarray(mesh.vertex_colors) if len(mesh.vertex_colors) > 0 else None
+
+    # ── Determine the "up" direction (plane normal) ────────────────────
+    if plane_model is not None:
+        a, b, c, d = plane_model
+        up = np.array([a, b, c], dtype=float)
+        up /= np.linalg.norm(up)
+        # The object is on the positive-signed-distance side of the plane.
+        # Ensure up points toward the object (positive mean projection).
+        if (verts @ up + d).mean() < 0:
+            up = -up
+        print(f"  Using RANSAC plane normal as up-axis: "
+              f"({up[0]:.3f}, {up[1]:.3f}, {up[2]:.3f})")
+    else:
+        up = np.array([0.0, 1.0, 0.0])
+        print("  No plane model — falling back to Y-up axis")
+
+    # ── Build an orthonormal basis for the disc plane ─────────────────
+    # tangent1 and tangent2 span the plane; up is the disc normal.
+    ref = np.array([1.0, 0.0, 0.0]) if abs(up[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    tangent1 = np.cross(up, ref);  tangent1 /= np.linalg.norm(tangent1)
+    tangent2 = np.cross(up, tangent1)
+
+    # ── Find the "bottom" of the object along the up axis ─────────────
+    # Project every vertex onto the up axis; minimum = base of object.
+    proj = verts @ up                    # scalar projection for each vertex
+    base_proj = proj.min()               # lowest point along up
+    obj_height = proj.max() - proj.min()
+
+    # ── Compute pedestal centre (footprint centroid at object base) ────
+    bottom_mask = proj <= base_proj + obj_height * 0.05   # bottom 5%
+    centre_3d = verts[bottom_mask].mean(axis=0) if bottom_mask.sum() > 0 \
+                else verts.mean(axis=0)
+    # Snap centre onto the base plane
+    centre_3d = centre_3d + (base_proj - centre_3d @ up) * up
+
+    # ── Compute pedestal radius from footprint ─────────────────────────
+    # Footprint = each vertex projected onto the disc plane (subtract up component)
+    up_scalars = verts @ up
+    footprint  = verts - up_scalars[:, np.newaxis] * up   # in-plane coords
+    centre_fp  = centre_3d - (centre_3d @ up) * up
+    dists = np.linalg.norm(footprint - centre_fp, axis=1)
+    pedestal_radius = dists.max() * PEDESTAL_PADDING
+
+    print(f"  Base centre (3D): ({centre_3d[0]:.4f}, {centre_3d[1]:.4f}, {centre_3d[2]:.4f})")
+    print(f"  Pedestal radius:  {pedestal_radius:.4f}")
+
+    # ── Sample bottom-edge colour ──────────────────────────────────────
+    if colors is not None and len(colors) > 0:
+        bottom_colors = colors[bottom_mask]
+        pedestal_color = bottom_colors.mean(axis=0) if len(bottom_colors) > 0 \
+                         else colors.mean(axis=0)
+        print(f"  Pedestal colour: RGB({pedestal_color[0]:.3f}, "
+              f"{pedestal_color[1]:.3f}, {pedestal_color[2]:.3f})  "
+              f"(sampled from {bottom_mask.sum():,} bottom-edge verts)")
+    else:
+        pedestal_color = np.array([0.4, 0.4, 0.4])
+        print("  Pedestal colour: neutral grey (no vertex colours on mesh)")
+
+    # ── Build disc vertices oriented along the plane normal ───────────
+    n       = PEDESTAL_RESOLUTION
+    h       = PEDESTAL_THICKNESS
+    angles  = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    cos_a   = np.cos(angles)
+    sin_a   = np.sin(angles)
+
+    # Top centre (touching object base) and bottom centre (slab below)
+    top_centre    = centre_3d
+    bottom_centre = centre_3d - up * h
+
+    # Ring vertices: sweep around the tangent plane
+    top_ring    = top_centre    + pedestal_radius * (cos_a[:, None] * tangent1 + sin_a[:, None] * tangent2)
+    bottom_ring = bottom_centre + pedestal_radius * (cos_a[:, None] * tangent1 + sin_a[:, None] * tangent2)
+
+    # Vertex layout: [top_centre(0), bottom_centre(1), top_ring(2..n+1), bottom_ring(n+2..2n+1)]
+    disc_verts = np.vstack([top_centre, bottom_centre, top_ring, bottom_ring])
+    tc_idx   = 0
+    bc_idx   = 1
+    tr_start = 2
+    br_start = 2 + n
+
+    faces = []
+    for i in range(n):
+        j = (i + 1) % n
+        faces.append([tc_idx, tr_start + j, tr_start + i])   # top fan
+        faces.append([bc_idx, br_start + i, br_start + j])   # bottom fan
+        ti, tj = tr_start + i, tr_start + j
+        bi, bj = br_start + i, br_start + j
+        faces.append([ti, tj, bj])                            # side wall
+        faces.append([ti, bj, bi])
+
+    disc_faces  = np.array(faces, dtype=np.int32)
+    disc_colors = np.tile(pedestal_color, (len(disc_verts), 1))
+
+    # ── Build Open3D mesh ─────────────────────────────────────────────
+    pedestal_mesh = o3d.geometry.TriangleMesh()
+    pedestal_mesh.vertices      = o3d.utility.Vector3dVector(disc_verts)
+    pedestal_mesh.triangles     = o3d.utility.Vector3iVector(disc_faces)
+    pedestal_mesh.vertex_colors = o3d.utility.Vector3dVector(disc_colors)
+    pedestal_mesh.compute_vertex_normals()
+    print(f"  Pedestal: {len(disc_verts):,} verts, {len(disc_faces):,} tris")
+
+    if output_dir:
+        o3d.io.write_triangle_mesh(str(output_dir / "pedestal.ply"), pedestal_mesh)
+
+    combined = mesh + pedestal_mesh
+    combined.compute_vertex_normals()
+    print(f"  Combined: {len(combined.vertices):,} verts, {len(combined.triangles):,} tris ✅")
+    return combined
+
+
+# ═══════════════════════════ PIPELINE ORCHESTRATOR ═══════════════════════════
+
+def run_pipeline(input_ply: Path, output_dir: Path):
+    """Single-scan pipeline: clean → mesh → pedestal."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pcd = o3d.io.read_point_cloud(str(input_ply))
@@ -385,59 +421,20 @@ def run_single_scan(input_ply: Path, output_dir: Path):
         raise RuntimeError(f"Empty point cloud: {input_ply}")
     print(f"📂 Loaded {len(pcd.points):,} points from {input_ply}")
 
-    pcd_clean = clean_cloud(pcd, label="scan", output_dir=output_dir)
+    pcd_clean, plane_model = clean_cloud(pcd, label="scan", output_dir=output_dir)
     mesh = generate_mesh(pcd_clean, colored_pcd=pcd_clean, output_dir=output_dir)
+
+    # Save object-only mesh — used by stylize.py so the pedestal stays unstyled
+    object_path = output_dir / "object_mesh.ply"
+    o3d.io.write_triangle_mesh(str(object_path), mesh)
+    print(f"  Object mesh saved to {object_path}")
+
+    mesh = generate_pedestal(mesh, plane_model=plane_model, output_dir=output_dir)
 
     final_path = output_dir / "final_mesh.ply"
     o3d.io.write_triangle_mesh(str(final_path), mesh)
     print(f"\n🎉 Done! Final mesh saved to {final_path}")
-    return mesh
-
-
-def run_two_pass(scan_a_ply: Path, scan_b_ply: Path, output_dir: Path):
-    """
-    Two-pass pipeline:
-      1. Clean each scan independently
-      2. Register Scan B onto Scan A
-      3. Merge, downsample, and mesh
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    pcd_a = o3d.io.read_point_cloud(str(scan_a_ply))
-    pcd_b = o3d.io.read_point_cloud(str(scan_b_ply))
-    if pcd_a.is_empty() or pcd_b.is_empty():
-        raise RuntimeError("One or both scan point clouds are empty.")
-    print(f"📂 Scan A: {len(pcd_a.points):,} points from {scan_a_ply}")
-    print(f"📂 Scan B: {len(pcd_b.points):,} points from {scan_b_ply}")
-
-    # ── Clean each scan ──────────────────────────────────────────────────
-    clean_a = clean_cloud(pcd_a, label="scan_a", output_dir=output_dir)
-    clean_b = clean_cloud(pcd_b, label="scan_b", output_dir=output_dir)
-
-    # ── Register Scan B onto Scan A ──────────────────────────────────────
-    _, aligned_b = register_clouds(
-        source=clean_b, target=clean_a, output_dir=output_dir,
-    )
-
-    # ── Merge and unify density ──────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"  FUSION — Merge & Downsample")
-    print(f"{'='*60}")
-
-    merged = clean_a + aligned_b
-    print(f"  Merged: {len(merged.points):,} points")
-
-    merged = merged.voxel_down_sample(voxel_size=REG_VOXEL_SIZE)
-    print(f"  After voxel unification: {len(merged.points):,} points")
-
-    o3d.io.write_point_cloud(str(output_dir / "merged_cloud.ply"), merged)
-
-    # ── Generate final mesh ──────────────────────────────────────────────
-    mesh = generate_mesh(merged, colored_pcd=merged, output_dir=output_dir)
-
-    final_path = output_dir / "final_mesh.ply"
-    o3d.io.write_triangle_mesh(str(final_path), mesh)
-    print(f"\n🎉 Done! Final two-pass mesh saved to {final_path}")
+    print(f"   To stylize without affecting the pedestal, use object_mesh.ply as input")
     return mesh
 
 
@@ -449,22 +446,11 @@ if __name__ == "__main__":
     default_output = project_root / "data" / "processed_data" / "mesh"
 
     parser = argparse.ArgumentParser(
-        description="3D Mesh Reconstruction — single-scan or two-pass flipped-scan",
+        description="3D Mesh Reconstruction with auto-pedestal",
     )
-
-    group = parser.add_mutually_exclusive_group(required=False)
-    group.add_argument(
-        "--input", type=str, default=None,
-        help="Single-scan mode: path to one .ply point cloud",
-    )
-    group.add_argument(
-        "--scan_a", type=str, default=None,
-        help="Two-pass mode: path to Scan A (upright) .ply",
-    )
-
     parser.add_argument(
-        "--scan_b", type=str, default=None,
-        help="Two-pass mode: path to Scan B (flipped) .ply",
+        "--input", type=str, default=None,
+        help="Path to input .ply point cloud (default: data/processed_data/reconstruction.ply)",
     )
     parser.add_argument(
         "--output", type=str, default=str(default_output),
@@ -473,11 +459,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     out = Path(args.output)
-
-    if args.scan_a and args.scan_b:
-        run_two_pass(Path(args.scan_a), Path(args.scan_b), out)
-    elif args.scan_a and not args.scan_b:
-        parser.error("--scan_a requires --scan_b for two-pass mode")
-    else:
-        input_path = Path(args.input) if args.input else default_input
-        run_single_scan(input_path, out)
+    input_path = Path(args.input) if args.input else default_input
+    run_pipeline(input_path, out)

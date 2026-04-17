@@ -119,31 +119,21 @@ def run_dust3r(raw_data_dir: Path, output_dir: Path, model, device, output_name:
 
 if __name__ == "__main__":
     project_root = Path(__file__).parent.parent.resolve()
-    raw_dir_up     = project_root / "data" / "raw_data_up"
-    raw_dir_bottom = project_root / "data" / "raw_data_bottom"
+    raw_dir    = project_root / "data" / "raw_data"
     processed_dir  = project_root / "data" / "processed_data"
 
-    if not has_images(raw_dir_up):
-        print(f"Error: No images found in {raw_dir_up}")
+    if not has_images(raw_dir):
+        print(f"Error: No images found in {raw_dir}")
         exit(1)
 
     model, device = load_model()
 
-    # ── Pass 1: Upright scan ─────────────────────────────────────────────
+    # ── Run DUSt3R on upright scan ──────────────────────────────────────
     print("\n" + "=" * 60)
-    print("  PASS 1 — Upright Scan (raw_data_up)")
+    print("  3D Reconstruction — (raw_data)")
     print("=" * 60)
-    normalize_images(raw_dir_up)
-    run_dust3r(raw_dir_up, processed_dir, model, device, output_name="scan_a.ply")
+    normalize_images(raw_dir)
+    run_dust3r(raw_dir, processed_dir, model, device, output_name="reconstruction.ply")
 
-    # ── Pass 2: Bottom scan (optional) ───────────────────────────────────
-    if has_images(raw_dir_bottom):
-        print("\n" + "=" * 60)
-        print("  PASS 2 — Bottom Scan (raw_data_bottom)")
-        print("=" * 60)
-        normalize_images(raw_dir_bottom)
-        run_dust3r(raw_dir_bottom, processed_dir, model, device, output_name="scan_b.ply")
-        print(":-) Both passes complete. Run mesh_reconstruction.py with --scan_a and --scan_b.")
-    else:
-        print(";-)  No bottom scan found — single-pass complete.")
-        print("   Run mesh_reconstruction.py with --input data/processed_data/scan_a.ply")
+    print("\n✅ Done! Run mesh_reconstruction.py to generate the final mesh:")
+    print("   python src/mesh_reconstruction.py")
