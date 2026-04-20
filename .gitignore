@@ -1,4 +1,6 @@
 data_creeper/
-data/
+data_capy/
+data/*
 dust3r/
 *.DS_Store
+!data/processed_data/

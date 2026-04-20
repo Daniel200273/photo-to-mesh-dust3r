@@ -7,21 +7,18 @@ Filters:
   - soft_voxel:  Downsample to a voxel grid with spheres (smooth voxel look)
   - hologram:    Extract edges and apply neon wireframe aesthetic
   - ff7:         PS1-era faceted look (aggressive decimation + flat shading)
-  - smooth:      Taubin surface denoising (fixes over-sharpened reconstructions)
-  - material:    Replace vertex colours with procedural textures
-                 presets: wood | stone | marble | clay | metal
-  - outline:     Cel-shade ink outline (darkens silhouette edges)
+  - material:    Replace vertex colours with physical textures
 
 Usage:
   python stylize.py --input mesh.ply --filter low_poly       --param 1500 --output styled.ply
-  python stylize.py --input mesh.ply --filter smooth         --param 15   --output smooth.ply
-  python stylize.py --input mesh.ply --filter material       --param marble --output marble.ply
-  python stylize.py --input mesh.ply --filter outline        --param 25   --output cel.ply
+    python stylize.py --input mesh.ply --filter low_poly       --param 1500 --close --output closed_lowpoly.ply
+  python stylize.py --input mesh.ply --filter material       --texture path/to.jpg --output styled.ply
   python stylize.py --input mesh.ply --filter hologram       --color 0.035,0.714,0.902 --output holo.ply
 """
 
 import open3d as o3d
 import numpy as np
+import sys
 from pathlib import Path
 
 # ═══════════════════════════ PARAMETERS ══════════════════════════════════════
@@ -35,84 +32,193 @@ LOW_POLY_VOXEL_DIVISOR    = 20             # Voxel size = bbox_size / divisor
 # VOXEL Filter
 VOXEL_SIZE_DEFAULT        = 0.01           # Default voxel cube size
 VOXEL_SAMPLE_DENSITY      = 2.0            # Multiplier for point sampling
+VOXEL_MAX_CUBES           = 200000         # Safety cap to avoid native Open3D crashes
+VOXEL_MAX_TRIANGLES       = 3000000        # Safe write threshold for voxel meshes
 
 # SOFT-VOXEL Filter
 SOFT_VOXEL_SIZE_DEFAULT   = 0.01           # Default soft voxel size
 SOFT_VOXEL_SPHERE_RADIUS_MULT = 0.6       # Sphere radius = voxel_size * this
+SOFT_VOXEL_MAX_NODES      = 150000         # Safety cap for sphere node count
 
 # HOLOGRAM Filter
 HOLOGRAM_TARGET_TRIANGLES = 2000           # Target tris for low-poly base
 HOLOGRAM_NEON_COLOR       = [0.035, 0.714, 0.902]  # #09b6e6 bright cyan
 HOLOGRAM_BODY_COLOR       = [0.259, 0.510, 0.961]  # #4287f5 blue
+HOLOGRAM_HOLE_CLOSE_MAX_TRIANGLES = 250000  # Auto-repair body holes below this density
 
 # FF7 Filter
 FF7_TARGET_TRIANGLES      = 800            # Very low poly (PS1 character range)
 FF7_COLOR_LEVELS          = 16             # Colour quantization steps per channel
                                            # (PS1 = 32 levels / 5-bit, 16 = more stylised)
-
-# SMOOTH Filter
-SMOOTH_ITERATIONS         = 10             # Taubin smoothing iterations (range 5–50)
-
-# MATERIAL Filter
-MATERIAL_DEFAULT_PRESET   = "wood"         # wood | stone | marble | clay | metal
-
-# OUTLINE Filter
-OUTLINE_SOFTNESS_DEG      = 25.0           # Width of the dark silhouette band (degrees)
-
-
-# ═══════════════════════════ NOISE HELPERS ════════════════════════════════════
-
-def _value_noise_3d(pts: np.ndarray, scale: float = 1.0, seed: int = 0) -> np.ndarray:
-    """
-    Fast deterministic trilinear value noise for an (N, 3) array of 3-D points.
-    Returns values in [0, 1].  Pure NumPy — no extra dependencies.
-    """
-    rng   = np.random.default_rng(seed)
-    GRID  = 64
-    table = rng.random((GRID, GRID, GRID))
-
-    p  = pts * scale
-    i0 = np.floor(p[:, 0]).astype(int) % GRID
-    j0 = np.floor(p[:, 1]).astype(int) % GRID
-    k0 = np.floor(p[:, 2]).astype(int) % GRID
-    i1 = (i0 + 1) % GRID
-    j1 = (j0 + 1) % GRID
-    k1 = (k0 + 1) % GRID
-
-    # Fractional part + smooth-step
-    fx = p[:, 0] - np.floor(p[:, 0]);  ux = fx * fx * (3 - 2 * fx)
-    fy = p[:, 1] - np.floor(p[:, 1]);  uy = fy * fy * (3 - 2 * fy)
-    fz = p[:, 2] - np.floor(p[:, 2]);  uz = fz * fz * (3 - 2 * fz)
-
-    # Trilinear interpolation
-    return (table[i0, j0, k0] * (1-ux)*(1-uy)*(1-uz) +
-            table[i1, j0, k0] *    ux *(1-uy)*(1-uz) +
-            table[i0, j1, k0] * (1-ux)*   uy *(1-uz) +
-            table[i1, j1, k0] *    ux *   uy *(1-uz) +
-            table[i0, j0, k1] * (1-ux)*(1-uy)*   uz  +
-            table[i1, j0, k1] *    ux *(1-uy)*   uz  +
-            table[i0, j1, k1] * (1-ux)*   uy *   uz  +
-            table[i1, j1, k1] *    ux *   uy *   uz)
-
-
-def _fbm(pts: np.ndarray, octaves: int = 4, scale: float = 1.0,
-         lacunarity: float = 2.0, gain: float = 0.5, seed: int = 0) -> np.ndarray:
-    """
-    Fractal Brownian Motion: sum of value-noise octaves at increasing frequencies.
-    Returns values in [0, 1].
-    """
-    total, amplitude, frequency, norm = np.zeros(len(pts)), 1.0, scale, 0.0
-    for i in range(octaves):
-        total     += amplitude * _value_noise_3d(pts, scale=frequency, seed=seed + i)
-        norm      += amplitude
-        amplitude *= gain
-        frequency *= lacunarity
-    return total / norm
-
-
 # ═══════════════════════════ FILTERS ═════════════════════════════════════════
 
-def apply_low_poly(mesh: o3d.geometry.TriangleMesh, target_triangles: int = LOW_POLY_TARGET_TRIANGLES) -> o3d.geometry.TriangleMesh:
+def decouple_geometry(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+    """
+    Shatters a mesh so every triangle has 3 mathematically unique, unshared vertices.
+    This strictly enforces Flat Shading by preventing the rendering engine from 
+    averaging vertex normals across sharp geometric boundaries (which causes 'missing faces' artifacts).
+    """
+    triangles = np.asarray(mesh.triangles)
+    vertices = np.asarray(mesh.vertices)
+    
+    new_vertices = vertices[triangles].reshape(-1, 3)
+    new_triangles = np.arange(len(new_vertices)).reshape(-1, 3)
+    
+    flat_mesh = o3d.geometry.TriangleMesh()
+    flat_mesh.vertices = o3d.utility.Vector3dVector(new_vertices)
+    flat_mesh.triangles = o3d.utility.Vector3iVector(new_triangles)
+    
+    if len(mesh.vertex_colors) > 0:
+        colors = np.asarray(mesh.vertex_colors)
+        new_colors = colors[triangles].reshape(-1, 3)
+        flat_mesh.vertex_colors = o3d.utility.Vector3dVector(new_colors)
+        
+    flat_mesh.compute_triangle_normals()
+    return flat_mesh
+
+
+def close_mesh_holes(
+    mesh: o3d.geometry.TriangleMesh,
+    label: str = "mesh",
+) -> o3d.geometry.TriangleMesh:
+    """Attempt to close open boundary loops while preserving vertex colors."""
+    import trimesh
+
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_unreferenced_vertices()
+
+    verts = np.asarray(mesh.vertices)
+    tris = np.asarray(mesh.triangles)
+    if len(verts) == 0 or len(tris) == 0:
+        return mesh
+
+    has_colors = len(mesh.vertex_colors) > 0
+    src_colors = np.asarray(mesh.vertex_colors) if has_colors else None
+
+    tm = trimesh.Trimesh(vertices=verts, faces=tris, process=False)
+    was_watertight = bool(tm.is_watertight)
+    faces_before = len(tm.faces)
+    trimesh.repair.fill_holes(tm)
+
+    # fill_holes is conservative; for large open bottoms, try a simple stitch fallback.
+    if not tm.is_watertight:
+        try:
+            stitched = trimesh.repair.stitch(tm, insert_vertices=True)
+            stitched = np.asarray(stitched, dtype=np.int64)
+            if stitched.size > 0:
+                stitched = stitched.reshape(-1, 3)
+                tm.faces = np.vstack([tm.faces, stitched])
+                trimesh.repair.fill_holes(tm)
+        except Exception:
+            pass
+
+    is_watertight = bool(tm.is_watertight)
+    faces_after = len(tm.faces)
+
+    print(f"  → Closing holes ({label}): watertight {was_watertight} -> {is_watertight}, "
+          f"faces {faces_before:,} -> {faces_after:,}")
+
+    closed = o3d.geometry.TriangleMesh()
+    closed.vertices = o3d.utility.Vector3dVector(tm.vertices)
+    closed.triangles = o3d.utility.Vector3iVector(tm.faces)
+
+    if has_colors and src_colors is not None and len(src_colors) > 0:
+        new_verts = np.asarray(tm.vertices)
+        if len(new_verts) == len(verts):
+            new_colors = src_colors
+        else:
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(verts)
+                _, idx = tree.query(new_verts, workers=-1)
+                new_colors = src_colors[idx]
+            except Exception:
+                avg = src_colors.mean(axis=0)
+                new_colors = np.tile(avg, (len(new_verts), 1))
+        closed.vertex_colors = o3d.utility.Vector3dVector(new_colors)
+
+    closed.compute_vertex_normals()
+    closed.compute_triangle_normals()
+    return closed
+
+
+def _pedestal_alignment_frame(
+    pedestal_path: str | None,
+    object_center: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Build world<->local rotation matrices from pedestal plane orientation."""
+    if not pedestal_path:
+        return None
+
+    ped_path = Path(pedestal_path)
+    if not ped_path.exists():
+        return None
+
+    pedestal = o3d.io.read_triangle_mesh(str(ped_path))
+    if pedestal.is_empty():
+        return None
+
+    verts = np.asarray(pedestal.vertices)
+    if len(verts) == 0:
+        return None
+
+    centered = verts - verts.mean(axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    up = vh[-1]
+    up_norm = np.linalg.norm(up)
+    if up_norm < 1e-12:
+        return None
+    up = up / up_norm
+
+    if object_center is not None:
+        ped_center = verts.mean(axis=0)
+        if np.dot(object_center - ped_center, up) < 0:
+            up = -up
+
+    ref = np.array([1.0, 0.0, 0.0]) if abs(up[0]) < 0.9 else np.array([0.0, 0.0, 1.0])
+    tangent1 = np.cross(up, ref)
+    t1_norm = np.linalg.norm(tangent1)
+    if t1_norm < 1e-12:
+        return None
+    tangent1 = tangent1 / t1_norm
+    tangent2 = np.cross(up, tangent1)
+    t2_norm = np.linalg.norm(tangent2)
+    if t2_norm < 1e-12:
+        return None
+    tangent2 = tangent2 / t2_norm
+
+    # Rows are local basis vectors in world coordinates.
+    world_to_local = np.vstack([tangent1, up, tangent2])
+    local_to_world = world_to_local.T
+    return world_to_local, local_to_world
+
+
+def _prepare_mesh_for_pedestal_aligned_voxelization(
+    mesh: o3d.geometry.TriangleMesh,
+    pedestal_path: str | None,
+) -> tuple[o3d.geometry.TriangleMesh, np.ndarray | None]:
+    """Rotate mesh into pedestal-aligned local frame for voxel-style filters."""
+    mesh_work = o3d.geometry.TriangleMesh(mesh)
+    local_to_world = None
+
+    frame = _pedestal_alignment_frame(
+        pedestal_path=pedestal_path,
+        object_center=np.asarray(mesh_work.vertices).mean(axis=0) if len(mesh_work.vertices) > 0 else None,
+    )
+    if frame is not None:
+        world_to_local, local_to_world = frame
+        mesh_work.rotate(world_to_local, center=(0, 0, 0))
+        print("  → Aligning voxel axes to pedestal plane...")
+
+    return mesh_work, local_to_world
+
+
+def apply_low_poly(
+    mesh: o3d.geometry.TriangleMesh,
+    target_triangles: int = LOW_POLY_TARGET_TRIANGLES,
+    force_close: bool = False,
+) -> o3d.geometry.TriangleMesh:
     """
     Simplify mesh to uniform low-poly style.
 
@@ -120,9 +226,13 @@ def apply_low_poly(mesh: o3d.geometry.TriangleMesh, target_triangles: int = LOW_
       1. Clean degenerate/duplicate geometry
       2. Taubin smoothing (volume-preserving noise removal)
       3. Midpoint subdivision (uniform triangles)
-      4. Voxel clustering decimation
-      5. Final cleanup
+            4. Optional voxel pre-pass (performance)
+            5. Quadric decimation to requested target triangles
+            6. Final cleanup
     """
+    if target_triangles <= 0:
+        raise ValueError("low_poly target_triangles must be > 0")
+
     print(f"Applying low-poly filter (target: {target_triangles} tris)...")
 
     # Clean
@@ -139,27 +249,64 @@ def apply_low_poly(mesh: o3d.geometry.TriangleMesh, target_triangles: int = LOW_
     print(f"  → Subdividing ({LOW_POLY_SUBDIVIDE_ITERS} iterations)...")
     mesh = mesh.subdivide_midpoint(number_of_iterations=LOW_POLY_SUBDIVIDE_ITERS)
 
-    # Scale-aware voxel clustering
-    bbox = mesh.get_axis_aligned_bounding_box()
-    size = np.linalg.norm(bbox.get_extent())
-    voxel_size = size / LOW_POLY_VOXEL_DIVISOR
+    # Optional voxel pre-pass: speed up very dense meshes before exact decimation.
+    # If the pre-pass drops below the requested target, we skip it and decimate from
+    # the subdivided mesh so the user-provided target remains authoritative.
+    mesh_simplified = mesh
+    tri_count = len(mesh.triangles)
+    if tri_count > target_triangles * 4:
+        bbox = mesh.get_axis_aligned_bounding_box()
+        size = np.linalg.norm(bbox.get_extent())
+        voxel_size = size / (np.sqrt(float(target_triangles)) * 1.5)
 
-    print(f"  → Voxel clustering (size: {voxel_size:.4f})...")
-    mesh_simplified = mesh.simplify_vertex_clustering(
-        voxel_size=voxel_size,
-        contraction=o3d.geometry.SimplificationContraction.Average
-    )
+        print(f"  → Voxel pre-pass (size: {voxel_size:.4f})...")
+        mesh_candidate = mesh.simplify_vertex_clustering(
+            voxel_size=voxel_size,
+            contraction=o3d.geometry.SimplificationContraction.Average,
+        )
+        mesh_candidate.remove_degenerate_triangles()
+        mesh_candidate.remove_unreferenced_vertices()
+
+        if len(mesh_candidate.triangles) >= target_triangles:
+            mesh_simplified = mesh_candidate
+            print(f"    after pre-pass: {len(mesh_simplified.triangles):,} tris")
+        else:
+            print(
+                f"    pre-pass undershot target ({len(mesh_candidate.triangles):,} < {target_triangles:,}); "
+                "using direct decimation"
+            )
+
+    if len(mesh_simplified.triangles) > target_triangles:
+        print(f"  → Quadric decimation to {target_triangles} triangles...")
+        mesh_simplified = mesh_simplified.simplify_quadric_decimation(
+            target_number_of_triangles=target_triangles
+        )
+    else:
+        print(
+            f"  → Input already at or below target ({len(mesh_simplified.triangles):,} <= {target_triangles:,}); "
+            "skipping decimation"
+        )
 
     # Final cleanup
     mesh_simplified.remove_degenerate_triangles()
     mesh_simplified.remove_unreferenced_vertices()
-    mesh_simplified.compute_triangle_normals()
+
+    if force_close:
+        mesh_simplified = close_mesh_holes(mesh_simplified, label="low_poly")
+    
+    # Decouple the geometry to permanently lock-in crisp flat shading without PBR artifacts
+    print("  → Decoupling facets for True Flat Shading...")
+    mesh_simplified = decouple_geometry(mesh_simplified)
 
     print(f"  ✓ Result: {len(mesh_simplified.vertices):,} verts, {len(mesh_simplified.triangles):,} tris")
     return mesh_simplified
 
 
-def apply_voxel(mesh: o3d.geometry.TriangleMesh, voxel_size: float = VOXEL_SIZE_DEFAULT) -> o3d.geometry.TriangleMesh:
+def apply_voxel(
+    mesh: o3d.geometry.TriangleMesh,
+    voxel_size: float = VOXEL_SIZE_DEFAULT,
+    pedestal_path: str | None = None,
+) -> o3d.geometry.TriangleMesh:
     """
     Convert mesh into Minecraft-style voxel blocks.
 
@@ -170,10 +317,12 @@ def apply_voxel(mesh: o3d.geometry.TriangleMesh, voxel_size: float = VOXEL_SIZE_
     """
     print(f"Applying voxel filter (size: {voxel_size})...")
 
+    mesh_work, local_to_world = _prepare_mesh_for_pedestal_aligned_voxelization(mesh, pedestal_path)
+
     # Sample mesh surface
-    num_samples = max(int(len(mesh.vertices) * VOXEL_SAMPLE_DENSITY), 200000)
+    num_samples = max(int(len(mesh_work.vertices) * VOXEL_SAMPLE_DENSITY), 200000)
     print(f"  → Sampling {num_samples:,} points...")
-    pcd = mesh.sample_points_uniformly(number_of_points=num_samples)
+    pcd = mesh_work.sample_points_uniformly(number_of_points=num_samples)
 
     # Create voxel grid
     print(f"  → Creating voxel grid...")
@@ -181,8 +330,14 @@ def apply_voxel(mesh: o3d.geometry.TriangleMesh, voxel_size: float = VOXEL_SIZE_
     voxels = voxel_grid.get_voxels()
     print(f"  → Reconstructing {len(voxels)} voxel cubes...")
 
+    if len(voxels) > VOXEL_MAX_CUBES:
+        raise RuntimeError(
+            f"Voxel grid too dense: {len(voxels):,} cubes exceeds safety limit {VOXEL_MAX_CUBES:,}. "
+            "Increase voxel size (recommended >= 0.003)."
+        )
+
     # Reconstruct mesh from voxels
-    cubes = []
+    voxel_mesh = o3d.geometry.TriangleMesh()
     for v in voxels:
         center = voxel_grid.get_voxel_center_coordinate(v.grid_index)
         cube = o3d.geometry.TriangleMesh.create_box(
@@ -190,22 +345,25 @@ def apply_voxel(mesh: o3d.geometry.TriangleMesh, voxel_size: float = VOXEL_SIZE_
         )
         cube.translate(center - np.array([voxel_size/2, voxel_size/2, voxel_size/2]))
         cube.paint_uniform_color(v.color)
-        cubes.append(cube)
+        voxel_mesh += cube
 
-    if not cubes:
+    if len(voxels) == 0:
         print("  ⚠ Warning: No voxels generated, returning original mesh")
         return mesh
 
-    voxel_mesh = cubes[0]
-    for cube in cubes[1:]:
-        voxel_mesh += cube
+    if local_to_world is not None:
+        voxel_mesh.rotate(local_to_world, center=(0, 0, 0))
 
     voxel_mesh.compute_vertex_normals()
     print(f"  ✓ Result: {len(voxel_mesh.vertices):,} verts, {len(voxel_mesh.triangles):,} tris")
     return voxel_mesh
 
 
-def apply_soft_voxel(mesh: o3d.geometry.TriangleMesh, voxel_size: float = SOFT_VOXEL_SIZE_DEFAULT) -> o3d.geometry.TriangleMesh:
+def apply_soft_voxel(
+    mesh: o3d.geometry.TriangleMesh,
+    voxel_size: float = SOFT_VOXEL_SIZE_DEFAULT,
+    pedestal_path: str | None = None,
+) -> o3d.geometry.TriangleMesh:
     """
     Create smooth voxel effect using overlapping spheres.
 
@@ -216,14 +374,22 @@ def apply_soft_voxel(mesh: o3d.geometry.TriangleMesh, voxel_size: float = SOFT_V
     """
     print(f"Applying soft-voxel filter (size: {voxel_size})...")
 
+    mesh_work, local_to_world = _prepare_mesh_for_pedestal_aligned_voxelization(mesh, pedestal_path)
+
     # Sample and downsample
-    pcd = mesh.sample_points_uniformly(number_of_points=len(mesh.vertices) * 2)
+    pcd = mesh_work.sample_points_uniformly(number_of_points=len(mesh_work.vertices) * 2)
     print(f"  → Downsampling to voxel grid...")
     pcd_down = pcd.voxel_down_sample(voxel_size=voxel_size)
 
     points = np.asarray(pcd_down.points)
     colors = np.asarray(pcd_down.colors)
     sphere_radius = voxel_size * SOFT_VOXEL_SPHERE_RADIUS_MULT
+
+    if len(points) > SOFT_VOXEL_MAX_NODES:
+        raise RuntimeError(
+            f"Soft-voxel grid too dense: {len(points):,} nodes exceeds safety limit {SOFT_VOXEL_MAX_NODES:,}. "
+            "Increase voxel size (recommended >= 0.003)."
+        )
 
     print(f"  → Creating {len(points)} sphere nodes...")
     final_mesh = o3d.geometry.TriangleMesh()
@@ -234,9 +400,68 @@ def apply_soft_voxel(mesh: o3d.geometry.TriangleMesh, voxel_size: float = SOFT_V
         node.paint_uniform_color(col)
         final_mesh += node
 
+    if local_to_world is not None:
+        final_mesh.rotate(local_to_world, center=(0, 0, 0))
+
     final_mesh.compute_vertex_normals()
     print(f"  ✓ Result: {len(final_mesh.vertices):,} verts, {len(final_mesh.triangles):,} tris")
     return final_mesh
+
+
+def _should_preserve_hologram_geometry(mesh: o3d.geometry.TriangleMesh) -> bool:
+    """Heuristic: keep geometry when mesh is already low-poly or voxel-like."""
+    tri_count = len(mesh.triangles)
+    if tri_count == 0:
+        return False
+
+    # Low-poly outputs are already in the target style.
+    if tri_count <= int(HOLOGRAM_TARGET_TRIANGLES * 1.5):
+        return True
+
+    # Reuse robust voxel-like detector (orientation-invariant).
+    return _is_voxel_like_mesh(mesh)
+
+
+def _prepare_hologram_base_mesh(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
+    """Clean and repair boundaries so hologram body does not look full of holes."""
+    prepared = o3d.geometry.TriangleMesh(mesh)
+    prepared.remove_degenerate_triangles()
+    prepared.remove_duplicated_vertices()
+    prepared.remove_unreferenced_vertices()
+
+    tri_count = len(prepared.triangles)
+    if tri_count == 0:
+        return prepared
+
+    watertight = False
+    try:
+        watertight = bool(prepared.is_watertight())
+    except Exception:
+        watertight = False
+
+    if not watertight:
+        if tri_count <= HOLOGRAM_HOLE_CLOSE_MAX_TRIANGLES:
+            print("  → Repairing open boundaries for hologram body...")
+            try:
+                # Hologram body is repainted, so skip expensive color transfer work.
+                repair_in = o3d.geometry.TriangleMesh(prepared)
+                repair_in.vertex_colors = o3d.utility.Vector3dVector()
+                prepared = close_mesh_holes(repair_in, label="hologram")
+            except Exception as e:
+                print(f"  ⚠ Hologram hole repair failed, proceeding without repair: {e}")
+        else:
+            print(
+                f"  → Skipping hole repair on very dense mesh ({tri_count:,} tris > "
+                f"{HOLOGRAM_HOLE_CLOSE_MAX_TRIANGLES:,})"
+            )
+
+    # Try to orient winding consistently to reduce backface-culling artifacts.
+    try:
+        prepared.orient_triangles()
+    except Exception:
+        pass
+
+    return prepared
 
 
 def apply_hologram(
@@ -245,24 +470,41 @@ def apply_hologram(
     simplify_first: bool = True
 ) -> dict:
     """
-    Create hologram effect: low-poly mesh + neon wireframe edges.
+    Create hologram effect: body tint + neon wireframe edges.
+    For already low-poly / voxel-like meshes, geometry is preserved.
 
     Returns dict with 'body' (mesh) and 'edges' (LineSet) for composite rendering.
     """
     print("Applying hologram effect...")
 
-    # Simplify to low-poly
-    if simplify_first:
+    neon = np.asarray(neon_color, dtype=float).reshape(-1)
+    if len(neon) != 3:
+        neon = np.asarray(HOLOGRAM_NEON_COLOR, dtype=float)
+    neon = np.clip(neon[:3], 0.0, 1.0)
+
+    # Simplify to low-poly for detailed inputs only.
+    preserve_geometry = simplify_first and _should_preserve_hologram_geometry(mesh)
+    if simplify_first and not preserve_geometry:
         print("  → Simplifying mesh to low-poly...")
-        mesh_base = apply_low_poly(mesh, target_triangles=HOLOGRAM_TARGET_TRIANGLES)
+        mesh_base = apply_low_poly(
+            mesh,
+            target_triangles=HOLOGRAM_TARGET_TRIANGLES,
+            force_close=True,
+        )
+    elif simplify_first and preserve_geometry:
+        print("  → Preserving source geometry (voxel/low-poly detected)...")
+        mesh_base = mesh
     else:
         mesh_base = mesh
 
+    mesh_base = _prepare_hologram_base_mesh(mesh_base)
+
     # Create body
-    print("  → Creating transparent blue body...")
+    body_color = np.clip(0.15 + 0.55 * neon, 0.0, 1.0)
+    print(f"  → Creating hologram body tint RGB({body_color[0]:.3f}, {body_color[1]:.3f}, {body_color[2]:.3f})...")
     mesh_body = o3d.geometry.TriangleMesh(mesh_base)
     mesh_body.vertex_colors = o3d.utility.Vector3dVector()
-    mesh_body.paint_uniform_color(HOLOGRAM_BODY_COLOR)
+    mesh_body.paint_uniform_color(body_color.tolist())
     mesh_body.compute_vertex_normals()
 
     # Extract edges
@@ -281,14 +523,15 @@ def apply_hologram(
     edges = o3d.geometry.LineSet()
     edges.points = mesh_base.vertices
     edges.lines = o3d.utility.Vector2iVector(all_edges)
-    edges.paint_uniform_color(neon_color)
+    edges.paint_uniform_color(neon.tolist())
 
     print(f"  ✓ Hologram: {len(mesh_body.vertices):,} verts, {len(all_edges)} edges")
 
     return {
         'body': mesh_body,
         'edges': edges,
-        'neon_color': neon_color
+        'neon_color': neon.tolist(),
+        'body_color': body_color.tolist(),
     }
 
 
@@ -296,6 +539,7 @@ def apply_ff7(
     mesh: o3d.geometry.TriangleMesh,
     target_triangles: int = FF7_TARGET_TRIANGLES,
     color_levels: int = FF7_COLOR_LEVELS,
+    force_close: bool = False,
 ) -> o3d.geometry.TriangleMesh:
     """
     Final Fantasy 7 (PS1 era) aesthetic.
@@ -366,6 +610,9 @@ def apply_ff7(
         mesh.remove_degenerate_triangles()
         mesh.remove_unreferenced_vertices()
 
+    if force_close:
+        mesh = close_mesh_holes(mesh, label="ff7")
+
     print(f"    ✓ {len(mesh.vertices):,} verts, {len(mesh.triangles):,} tris")
 
     # Re-transfer colours from original mesh via nearest-neighbour lookup
@@ -398,18 +645,15 @@ def apply_ff7(
         # Quantize: snap each channel to nearest step
         avg_colors  = np.floor(avg_colors * color_levels) / color_levels
         avg_colors  = np.clip(avg_colors, 0.0, 1.0)
-        # Assign the same flat colour to all 3 vertices of every face
-        new_colors  = np.repeat(avg_colors, 3, axis=0)  # (n_tris×3, 3)
+        new_colors  = np.repeat(avg_colors, 3, axis=0)
     else:
         new_colors = None
 
-    # ── Assemble result ──────────────────────────────────────────────────
     flat_mesh = o3d.geometry.TriangleMesh()
     flat_mesh.vertices  = o3d.utility.Vector3dVector(new_verts)
     flat_mesh.triangles = o3d.utility.Vector3iVector(new_tris)
     if new_colors is not None:
         flat_mesh.vertex_colors = o3d.utility.Vector3dVector(new_colors)
-    # Use triangle normals (flat), not smooth vertex normals
     flat_mesh.compute_triangle_normals()
 
     print(f"  ✓ Result: {len(flat_mesh.vertices):,} verts, "
@@ -419,204 +663,250 @@ def apply_ff7(
 
 def apply_smooth(
     mesh: o3d.geometry.TriangleMesh,
-    iterations: int = SMOOTH_ITERATIONS,
+    iterations: int = 5,
+    sigma: float = 0.0,
 ) -> o3d.geometry.TriangleMesh:
     """
-    Denoise / polish the mesh surface using Taubin smoothing.
-
-    Taubin smoothing alternates a positive Laplacian pass (λ) and a negative
-    pass (μ) so the two steps roughly cancel volume shrinkage — unlike plain
-    Laplacian which collapses the mesh over many iterations.
-
-    This is ideal for fixing over-sharpened, speckled surfaces that come out
-    of Screened Poisson reconstruction.
+    Gaussian-weighted spatial smoothing for both Geometry and Color.
 
     Args:
-      iterations: number of Taubin iterations (default 10, range 5–50).
-                  More iterations → smoother surface but less fine detail.
+      iterations: number of Gaussian-Laplacian passes.
+      sigma:      Gaussian radius in mesh units (0 = auto).
     """
-    print(f"Applying smooth filter ({iterations} Taubin iterations) …")
+    from scipy.spatial import cKDTree
 
-    # Lightweight pre-clean
+    print(f"Applying Gaussian-Laplacian smooth filter "
+          f"({iterations} passes, sigma={'auto' if sigma <= 0 else f'{sigma:.4f}'}) …")
+
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_vertices()
     mesh.remove_unreferenced_vertices()
 
-    print("  → Running Taubin smoothing …")
-    mesh = mesh.filter_smooth_taubin(number_of_iterations=iterations)
+    import trimesh
+    print("  → Filling holes …")
+    verts_before = np.asarray(mesh.vertices)
+    has_colors = len(mesh.vertex_colors) > 0
+    colors_before = np.asarray(mesh.vertex_colors) if has_colors else None
+    
+    tm = trimesh.Trimesh(
+        vertices=verts_before, 
+        faces=np.asarray(mesh.triangles), 
+        process=False
+    )
+    trimesh.repair.fill_holes(tm)
+    
+    mesh.triangles = o3d.utility.Vector3iVector(tm.faces)
+    verts = np.asarray(tm.vertices).copy()
+    
+    if has_colors:
+        n_added = len(verts) - len(verts_before)
+        if n_added > 0:
+            print(f"    Filled holes: added {n_added} new vertices")
+            added_colors = np.full((n_added, 3), 0.5)
+            colors = np.vstack([colors_before, added_colors]).copy()
+        else:
+            colors = colors_before.copy()
+    else:
+        colors = None
+
+    orig_verts = verts.copy()
+
+    if sigma <= 0:
+        sample_pts = verts[np.random.choice(len(verts), min(len(verts), 10000), replace=False)]
+        tree_sample = cKDTree(sample_pts)
+        d, _ = tree_sample.query(sample_pts, k=2, workers=-1)
+        mean_edge = d[:, 1].mean()
+        sigma = mean_edge * 2.0
+        print(f"  → Auto sigma = {sigma:.5f}  (from sample mean NN dist={mean_edge:.5f})")
+
+    inv_2sig2 = 1.0 / (2.0 * sigma * sigma)
+
+    print(f"  → Building KD-Tree for spatial neighbors …")
+    tree = cKDTree(verts)
+    dists, indices = tree.query(verts, k=10, workers=-1)
+
+    weights = np.exp(-(dists**2) * inv_2sig2)
+    weights /= weights.sum(axis=1, keepdims=True)
+
+    print("  → Blurring geometry and colors …")
+    for it in range(iterations):
+        verts = (weights[:, :, None] * verts[indices]).sum(axis=1)
+        if has_colors:
+            colors = (weights[:, :, None] * colors[indices]).sum(axis=1)
+
+        print(f"    iteration {it + 1}/{iterations} done")
+
+    mu = 0.1 * iterations
+    displacement = verts - orig_verts
+    verts = verts - mu * displacement
+    print(f"  → Shrinkage correction applied to geometry (μ={mu:.2f})")
+
+    mesh.vertices = o3d.utility.Vector3dVector(verts)
+    if has_colors:
+        # Clip colors safely to [0, 1] range after blending
+        mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
 
     mesh.compute_vertex_normals()
     mesh.compute_triangle_normals()
 
-    print(f"  ✓ Result: {len(mesh.vertices):,} verts, {len(mesh.triangles):,} tris  (smoothed)")
+    print(f"  ✓ Result: {len(mesh.vertices):,} verts (Geometry + Color smoothed)")
     return mesh
 
+
+def _sample_texture(img: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Vectorized texture sampler taking UVs in [0, 1] and handling wrapping."""
+    H, W = img.shape[:2]
+    u = u % 1.0
+    v = v % 1.0
+    x = (u * (W - 1)).astype(int)
+    y = ((1.0 - v) * (H - 1)).astype(int)
+    
+    sampled = img[y, x] / 255.0
+    if sampled.ndim == 1:
+        sampled = np.stack([sampled]*3, axis=-1)
+    elif sampled.shape[-1] == 4:
+        sampled = sampled[:, :3]
+    return sampled
+
+
+def _is_voxel_like_mesh(mesh: o3d.geometry.TriangleMesh) -> bool:
+    """Heuristic detector for blocky voxel meshes (orientation-invariant)."""
+    if len(mesh.triangles) == 0:
+        return False
+
+    mesh.compute_triangle_normals()
+    tri_normals = np.asarray(mesh.triangle_normals)
+    if len(tri_normals) == 0:
+        return False
+
+    # Subsample for speed on very large meshes.
+    if len(tri_normals) > 200000:
+        step = max(1, len(tri_normals) // 200000)
+        tri_normals = tri_normals[::step]
+
+    norms = np.linalg.norm(tri_normals, axis=1, keepdims=True)
+    tri_normals = tri_normals / np.maximum(norms, 1e-12)
+
+    # Orientation-invariant signature: opposite normals collapse via abs().
+    abs_normals = np.abs(tri_normals)
+    quantized = np.round(abs_normals, 3)
+    unique_dirs = len(np.unique(quantized, axis=0))
+
+    # Voxel meshes (even rotated) generally have very few dominant face directions.
+    if unique_dirs <= 20:
+        return True
+
+    # Fallback for axis-aligned voxel meshes.
+    axis_aligned_ratio = float((np.max(abs_normals, axis=1) > 0.995).mean())
+    return axis_aligned_ratio > 0.9
 
 def apply_material(
     mesh: o3d.geometry.TriangleMesh,
-    preset: str = MATERIAL_DEFAULT_PRESET,
+    texture_path: str = None,
+    shininess: float = 48.0,
+    scale: float = 1.0,
+    preserve_geometry: bool = False,
 ) -> o3d.geometry.TriangleMesh:
     """
-    Replace vertex colours with a procedural material texture driven by 3-D
-    vertex positions.  No UV unwrapping needed — entirely geometry-based.
-
-    The existing scan colours are replaced (this is a stylization filter).
-    For best results, run `smooth` first to remove reconstruction noise.
-
-    Presets
-    -------
-    wood   — concentric cylindrical rings + fractal grain noise
-    stone  — cool-grey layered value noise (multi-scale rock face)
-    marble — sinusoidal colour veins driven by turbulence noise
-    clay   — warm terracotta with height-based ambient-occlusion darkening
-    metal  — anisotropic Blinn-Phong shading using surface normals (steel)
-
-    Args:
-      preset: one of 'wood', 'stone', 'marble', 'clay', 'metal'
+    Replace vertex colours with a material texture driven by 3-D vertex positions.
+    UV mapping issue is circumvented using Image-based Triplanar Mapping.
     """
-    VALID = {"wood", "stone", "marble", "clay", "metal"}
-    if preset not in VALID:
-        raise ValueError(f"Unknown material preset '{preset}'. Choose from: {VALID}")
+    print(f"Applying material filter…")
 
-    print(f"Applying material filter (preset: {preset}) …")
+
+    original_verts = len(mesh.vertices)
+    voxel_like = _is_voxel_like_mesh(mesh)
+    preserve = preserve_geometry or voxel_like
+    if preserve_geometry:
+        print("  → Preserve-geometry mode enabled: skipping smoothing/subdivision")
+    
+    if original_verts > 150000 and not preserve:
+        # High resolution organic NeRF meshes contain millions of microscopic surface bumps.
+        # Under intense PBR lighting, these bumps act like randomized mirrors, causing extreme flickering.
+        print("  → Ironing out high-res micro-surface noise to prevent lighting alias flickering...")
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=5)
+    elif original_verts > 150000 and preserve:
+        print("  → Voxel-like mesh detected: skipping smoothing to preserve block structure")
+        
+    if texture_path and Path(texture_path).exists():
+        # High-res textures require high vertex density because we bake into vertex_colors.
+        # If the mesh is low-poly, it physically lacks the "pixels" to show the image details!
+        # subdivide_midpoint adds vertices but strictly preserves flat, blocky geometry!
+        TARGET_MIN_VERTS = 150000
+        if len(mesh.vertices) < TARGET_MIN_VERTS and not preserve:
+            print(f"  → Low vertex count detected. Subdividing geometry to increase texture resolution...")
+            while len(mesh.vertices) < TARGET_MIN_VERTS:
+                mesh = mesh.subdivide_midpoint(number_of_iterations=1)
+            print(f"  → Geometry boosted to {len(mesh.vertices)} vertices for crisp textures!")
+        elif preserve:
+            print("  → Voxel-like mesh detected: skipping auto-subdivision")
 
     pts = np.asarray(mesh.vertices)
-
-    # Normalize coordinates to [0, 1]³ for scale-independent noise
-    lo  = pts.min(axis=0)
-    hi  = pts.max(axis=0)
-    rng_size = hi - lo
-    rng_size[rng_size < 1e-8] = 1.0          # avoid divide-by-zero on flat dims
-    pts_n = (pts - lo) / rng_size            # (N, 3) in [0, 1]³
-
-    if preset == "wood":
-        # ── Wood ──────────────────────────────────────────────────────
-        # Concentric cylindrical rings around the Y axis, perturbed by
-        # fractal grain noise so the rings look organic.
-        cx, cz  = 0.5, 0.5
-        r       = np.sqrt((pts_n[:, 0] - cx)**2 + (pts_n[:, 2] - cz)**2)
-        grain   = _fbm(pts_n, octaves=5, scale=6.0, seed=42)
-        rings   = np.sin(r * 22.0 * np.pi + grain * 3.5) * 0.5 + 0.5  # [0, 1]
-
-        dark_wood  = np.array([0.33, 0.16, 0.04])
-        light_wood = np.array([0.76, 0.52, 0.22])
-        colors = dark_wood + rings[:, None] * (light_wood - dark_wood)
-
-    elif preset == "stone":
-        # ── Stone ─────────────────────────────────────────────────────
-        # Cool grey multi-scale value noise — looks like a weathered rock
-        # face or natural stone surface.
-        n      = _fbm(pts_n, octaves=6, scale=5.0, gain=0.55, seed=7)
-        dark   = np.array([0.32, 0.31, 0.33])
-        light  = np.array([0.76, 0.75, 0.72])
-        colors = dark + n[:, None] * (light - dark)
-
-    elif preset == "marble":
-        # ── Marble ────────────────────────────────────────────────────
-        # Sinusoidal veins in one axis perturbed by turbulence noise —
-        # the classic procedural marble pattern.
-        turb   = _fbm(pts_n, octaves=6, scale=4.5, gain=0.6, seed=13)
-        veins  = np.sin(pts_n[:, 0] * 9.0 + turb * 7.0) * 0.5 + 0.5  # [0, 1]
-
-        white  = np.array([0.95, 0.93, 0.91])
-        vein_c = np.array([0.22, 0.20, 0.22])
-        colors = white + veins[:, None] * (vein_c - white)
-
-    elif preset == "clay":
-        # ── Clay ──────────────────────────────────────────────────────
-        # Warm terracotta tint with height-based pseudo-AO: vertices
-        # lower on the Y axis are slightly darker (like dried, unglazed clay).
-        height = pts_n[:, 1]                                         # Y = up
-        noise  = _fbm(pts_n, octaves=3, scale=4.0, seed=99) * 0.12
-        t      = np.clip(height + noise, 0.0, 1.0)
-
-        shadow = np.array([0.50, 0.24, 0.12])
-        light_c= np.array([0.82, 0.46, 0.28])
-        colors = shadow + t[:, None] * (light_c - shadow)
-
-    elif preset == "metal":
-        # ── Metal ─────────────────────────────────────────────────────
-        # Anisotropic Blinn-Phong shading using the mesh's vertex normals.
-        # Gives the appearance of brushed steel under a fixed studio light.
-        mesh.compute_vertex_normals()
-        normals = np.asarray(mesh.vertex_normals)
-
-        light_dir = np.array([0.6, 0.8, 0.3]);  light_dir /= np.linalg.norm(light_dir)
-        view_dir  = np.array([0.0, 0.0, 1.0])
-        half      = light_dir + view_dir;        half /= np.linalg.norm(half)
-
-        diffuse   = np.clip(normals @ light_dir, 0.0, 1.0)           # (N,)
-        specular  = np.clip(normals @ half,       0.0, 1.0) ** 48    # (N,)
-        # Add a secondary fill light from the opposite side for depth
-        fill_dir  = np.array([-0.4, 0.5, -0.6]); fill_dir /= np.linalg.norm(fill_dir)
-        fill      = np.clip(normals @ fill_dir, 0.0, 1.0) * 0.25
-
-        base_col  = np.array([0.52, 0.55, 0.60])
-        hi_col    = np.array([0.96, 0.97, 1.00])
-        colors = (base_col * (diffuse[:, None] * 0.65 + fill[:, None])
-                  + hi_col * specular[:, None] * 0.85)
-        colors = np.clip(colors, 0.0, 1.0)
-
-    mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
     mesh.compute_vertex_normals()
+    normals = np.asarray(mesh.vertex_normals)
 
-    print(f"  ✓ Result: {len(mesh.vertices):,} verts — '{preset}' material applied")
-    return mesh
+    # Normalize vertex coordinates to [0, 1]³ so that texture scaling is independent
+    # of the mesh's absolute physical size (prevents extreme zoom-in blurring on tiny meshes)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    rng_size = np.maximum(hi - lo, 1e-8)
+    pts_n = (pts - lo) / rng_size
 
-
-def apply_outline(
-    mesh: o3d.geometry.TriangleMesh,
-    softness_deg: float = OUTLINE_SOFTNESS_DEG,
-) -> o3d.geometry.TriangleMesh:
-    """
-    Cel-shading ink outline: darken vertices whose normals are nearly
-    perpendicular to the camera (i.e. silhouette edges).
-
-    The technique is purely colour-based — no extra geometry is added.
-    Works best on a mesh that already has vertex colours (scan colours or
-    a material preset applied first).
-
-    Args:
-      softness_deg: angular width of the dark silhouette band in degrees
-                    (default 25, range 10–45).  Larger → wider dark band.
-    """
-    print(f"Applying outline filter (softness: {softness_deg}°) …")
-
-    # Ensure normals are up to date
-    mesh.compute_vertex_normals()
-    normals = np.asarray(mesh.vertex_normals)            # (N, 3)
-
-    # Existing colours — fall back to white if mesh has none
-    if len(mesh.vertex_colors) > 0:
-        colors = np.asarray(mesh.vertex_colors).copy()
+    # ── 1. Calculate Base Colors (Albedo) ──
+    if texture_path and Path(texture_path).exists():
+        # IMAGE-BASED TRIPLANAR MAPPING
+        print(f"  → Loading seamless texture: {Path(texture_path).name}")
+        try:
+            # We use Open3D's image IO
+            img_o3d = o3d.io.read_image(texture_path)
+            img_arr = np.asarray(img_o3d)
+            if img_arr.size == 0:
+                raise ValueError("Image empty")
+                
+            # Drastically bump sharpness (exponent 16) to prevent textures from blending/blurring 
+            # into a muddy mess on diagonal surfaces.
+            weights = np.abs(normals) ** 16.0
+            weights /= np.maximum(np.sum(weights, axis=1, keepdims=True), 1e-8)
+            
+            # Use normalized coordinates so scale=1.0 means exactly 1 repetition across the object
+            uv_x = pts_n[:, [2, 1]] * scale
+            uv_y = pts_n[:, [0, 2]] * scale
+            uv_z = pts_n[:, [0, 1]] * scale
+            
+            col_x = _sample_texture(img_arr, uv_x[:, 0], uv_x[:, 1])
+            col_y = _sample_texture(img_arr, uv_y[:, 0], uv_y[:, 1])
+            col_z = _sample_texture(img_arr, uv_z[:, 0], uv_z[:, 1])
+            
+            base_col = col_x * weights[:, [0]] + col_y * weights[:, [1]] + col_z * weights[:, [2]]
+        except Exception as e:
+            print(f"  ⚠ Failed to load texture {texture_path}. Falling back to grey. Error: {e}")
+            base_col = np.full((len(pts), 3), 0.5)
     else:
-        colors = np.ones((len(normals), 3))
+        # Safe fallback: keep existing mesh colors when available, otherwise neutral albedo.
+        if len(mesh.vertex_colors) > 0:
+            print("  → No texture provided; reusing existing vertex colors as albedo")
+            base_col = np.asarray(mesh.vertex_colors)
+        else:
+            print("  → No texture provided; using neutral grey albedo")
+            base_col = np.full((len(pts), 3), 0.55)
 
-    # View direction: camera looks along -Z in Open3D's default coordinate
-    # frame, so we test against +Z as the "facing" direction.
-    view = np.array([0.0, 0.0, 1.0])
+    # ── 2. Real-Time Lighting Handoff ──
+    # We DO NOT bake diffuse/specular lighting into the vertex colors! 
+    # Baking view-dependent lighting (like specular gloss or cast shadows) paints them permanently onto the 
+    # geometry. When you rotate the object, the highlights rotate with it like a painted white sticker.
+    # Instead, we provide the pure Albedo (texture color) and allow the interactive 3D engine to render real-time lighting!
 
-    # |normal · view| = cos(angle from silhouette plane)
-    # = 0 at silhouette edge, = 1 at face-on centre
-    cos_a = np.abs(normals @ view)                       # (N,) in [0, 1]
-
-    # Map to a smooth dark-band factor:
-    # threshold = sin(softness_deg) ≈ cos(90° - softness_deg)
-    threshold = np.sin(np.radians(softness_deg))
-    factor    = np.clip(cos_a / max(threshold, 1e-6), 0.0, 1.0)  # 0 = dark, 1 = lit
-
-    # Smooth-step for a softer transition
-    factor = factor * factor * (3.0 - 2.0 * factor)
-
-    # Apply: silhouette vertices go black, interior vertices stay at original colour
-    darkened = colors * factor[:, None]
-
-    mesh.vertex_colors = o3d.utility.Vector3dVector(darkened)
+    if base_col.ndim == 1:
+        base_col = np.tile(base_col, (len(pts), 1))
+        
+    colors = np.clip(base_col, 0.0, 1.0)
+    
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
     mesh.compute_vertex_normals()
 
-    outline_pct = (factor < 0.5).mean() * 100
-    print(f"  ✓ Outline applied — {outline_pct:.1f}% of vertices darkened as silhouette")
+    print(f"  ✓ Result: {len(mesh.vertices):,} verts — material applied (shininess: {shininess})")
     return mesh
+
+
 
 
 # ═══════════════════════════ CLI ═════════════════════════════════════════════
@@ -633,16 +923,14 @@ filter / --param pairs
   voxel      --param <float>  voxel cube size                (default 0.01)
   soft_voxel --param <float>  sphere / voxel size            (default 0.01)
   ff7        --param <int>    target triangle count          (default 800)
-  smooth     --param <int>    Taubin iterations (5–50)       (default 10)
-  material   --param <str>    wood|stone|marble|clay|metal   (default wood)
-  outline    --param <float>  silhouette band degrees (10–45)(default 25)
   hologram   --color R,G,B   neon edge colour override
+    --close                    force-close open boundary holes (low_poly/ff7)
 """)
     parser.add_argument("--input",    type=str, required=True,
                         help="Input mesh file (.ply/.obj)")
     parser.add_argument("--filter",   type=str, default="low_poly",
                         choices=["low_poly", "voxel", "soft_voxel", "hologram",
-                                 "ff7", "smooth", "material", "outline"],
+                                 "ff7", "material"],
                         help="Filter to apply (see epilog for --param meaning)")
     parser.add_argument("--output",  type=str, required=True,
                         help="Output path for styled mesh(es)")
@@ -651,7 +939,17 @@ filter / --param pairs
     parser.add_argument("--color",   type=str, default=None,
                         help="Hologram edge colour as CSV: R,G,B (e.g. 0.035,0.714,0.902)")
     parser.add_argument("--pedestal", type=str, default=None,
-                        help="Path to pedestal .ply to re-attach after styling (stays unstyled)")
+                        help="Optional pedestal mesh path used as orientation reference for voxel filters")
+    parser.add_argument("--close", action="store_true",
+                        help="Force close open boundaries for low_poly and ff7 filters")
+    parser.add_argument("--texture", type=str, default=None,
+                        help="Path to seamless image texture for the material filter")
+    parser.add_argument("--shininess", type=float, default=48.0,
+                        help="Specular shininess for material lighting")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Texture scale multiplier for triplanar mapping")
+    parser.add_argument("--preserve-geometry", action="store_true",
+                        help="For material filter: skip smoothing/subdivision to preserve original geometry")
 
     args = parser.parse_args()
 
@@ -665,55 +963,50 @@ filter / --param pairs
     # ── Apply filter ──────────────────────────────────────────────────────
     if args.filter == "low_poly":
         target = int(args.param) if args.param else LOW_POLY_TARGET_TRIANGLES
-        styled = apply_low_poly(mesh, target)
+        styled = apply_low_poly(mesh, target, force_close=args.close)
 
     elif args.filter == "voxel":
         vsize  = float(args.param) if args.param else VOXEL_SIZE_DEFAULT
-        styled = apply_voxel(mesh, vsize)
+        styled = apply_voxel(mesh, vsize, pedestal_path=args.pedestal)
 
     elif args.filter == "soft_voxel":
         vsize  = float(args.param) if args.param else SOFT_VOXEL_SIZE_DEFAULT
-        styled = apply_soft_voxel(mesh, vsize)
+        styled = apply_soft_voxel(mesh, vsize, pedestal_path=args.pedestal)
 
     elif args.filter == "hologram":
         color = HOLOGRAM_NEON_COLOR
         if args.color:
             try:
-                color = [float(x) for x in args.color.split(",")]
+                parsed = [float(x) for x in args.color.split(",")]
+                if len(parsed) == 3:
+                    color = parsed
+                else:
+                    print(f"Warning: Expected 3 RGB values, got {len(parsed)}; using default {color}")
             except ValueError:
                 print(f"Warning: Invalid color format, using default {color}")
         styled = apply_hologram(mesh, color)
 
     elif args.filter == "ff7":
         target = int(args.param) if args.param else FF7_TARGET_TRIANGLES
-        styled = apply_ff7(mesh, target_triangles=target, color_levels=FF7_COLOR_LEVELS)
-
-    elif args.filter == "smooth":
-        iters  = int(args.param) if args.param else SMOOTH_ITERATIONS
-        styled = apply_smooth(mesh, iterations=iters)
+        styled = apply_ff7(
+            mesh,
+            target_triangles=target,
+            color_levels=FF7_COLOR_LEVELS,
+            force_close=args.close,
+        )
 
     elif args.filter == "material":
-        preset = args.param if args.param else MATERIAL_DEFAULT_PRESET
-        styled = apply_material(mesh, preset=preset)
+        styled = apply_material(
+            mesh,
+            texture_path=args.texture,
+            shininess=args.shininess,
+            scale=args.scale,
+            preserve_geometry=args.preserve_geometry,
+        )
 
-    elif args.filter == "outline":
-        softness = float(args.param) if args.param else OUTLINE_SOFTNESS_DEG
-        styled   = apply_outline(mesh, softness_deg=softness)
-
-    # ── Re-attach pedestal (unstyled) ────────────────────────────────────
-    if args.pedestal:
-        print(f"Loading pedestal from {args.pedestal} …")
-        pedestal = o3d.io.read_triangle_mesh(args.pedestal)
-        if pedestal.is_empty():
-            print("  ⚠ Warning: pedestal file is empty, skipping")
-        else:
-            if isinstance(styled, dict) and 'body' in styled:
-                styled['body'] = styled['body'] + pedestal
-                styled['body'].compute_vertex_normals()
-            else:
-                styled = styled + pedestal
-                styled.compute_vertex_normals()
-            print("  ✓ Pedestal re-attached (unstyled)")
+    # Note: Pedestal attachment logic completely removed from stylize.py
+    # to prevent chained filters from permanently destroying it. 
+    # visualization handles it cleanly!
 
     # ── Save output ───────────────────────────────────────────────────────
     output_path = Path(args.output)
@@ -728,5 +1021,11 @@ filter / --param pairs
         print(f"✓ Hologram body saved to:  {body_path}")
         print(f"✓ Hologram edges saved to: {edges_path}")
     else:
+        if args.filter in {"voxel", "soft_voxel"} and len(styled.triangles) > VOXEL_MAX_TRIANGLES:
+            print(
+                f"Error: mesh too dense to write safely ({len(styled.triangles):,} triangles). "
+                "Increase voxel size (recommended >= 0.003)."
+            )
+            sys.exit(1)
         o3d.io.write_triangle_mesh(str(output_path), styled)
         print(f"✓ Styled mesh saved to: {output_path}")

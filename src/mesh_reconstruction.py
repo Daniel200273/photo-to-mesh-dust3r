@@ -24,8 +24,9 @@ from pathlib import Path
 # ═══════════════════════════ PARAMETERS ══════════════════════════════════════
 
 # Cleanser — Statistical Outlier Removal
+MICRO_VOXEL_SIZE  = 0.0     # 0 = disabled. Used to be 0.0005
 SOR_NB_NEIGHBORS  = 20
-SOR_STD_RATIO     = 2.0
+SOR_STD_RATIO     = 2.05
 
 # Cleanser — RANSAC Plane Segmentation
 PLANE_DISTANCE_THRESHOLD = 0.005
@@ -39,8 +40,19 @@ CLUSTER_MIN_POINTS = 10
 CLUSTER_VOXEL_SIZE = 0.005
 
 # Mesher — Poisson Surface Reconstruction
-POISSON_DEPTH          = 9
-POISSON_TRIM_DISTANCE  = 0.02
+POISSON_DEPTH          = 8
+POISSON_DENSITY_QUANT  = 0.05
+
+# Mesher — Point Cloud Spatial Smoothing
+CLOUD_SMOOTH_ITERS     = 2
+CLOUD_SMOOTH_K         = 30
+CLOUD_SMOOTH_SIGMA     = 0.002
+
+# Mesher — Post-clean
+MIN_COMPONENT_RATIO    = 0.01
+
+# Mesher — Smoothing
+RECON_SMOOTH_ITERS     = 3
 
 # Mesher — Color Transfer
 COLOR_KNN = 1
@@ -58,7 +70,7 @@ def clean_cloud(
     pcd: o3d.geometry.PointCloud,
     label: str = "scan",
     output_dir: Path | None = None,
-) -> o3d.geometry.PointCloud:
+) -> tuple[o3d.geometry.PointCloud, tuple[float, float, float, float] | None]:
     """
     Full cleansing pipeline for a single raw point cloud.
 
@@ -77,6 +89,14 @@ def clean_cloud(
     print(f"\n{'='*60}")
     print(f"  CLEANSER — {label}")
     print(f"{'='*60}")
+
+    # ── Step 0: Micro-Voxel Downsampling (Smoothing) ─────────────────────
+    if MICRO_VOXEL_SIZE > 0:
+        print(f"\n  [{label}] Micro-Voxel Downsampling (Smoothing)")
+        before = len(pcd.points)
+        pcd = pcd.voxel_down_sample(voxel_size=MICRO_VOXEL_SIZE)
+        after = len(pcd.points)
+        print(f"    Merged points: {before:,} → {after:,} ({100*(before-after)/before:.1f}%)")
 
     # ── Step 1: Statistical Outlier Removal ──────────────────────────────
     print(f"\n  [{label}] Statistical Outlier Removal")
@@ -181,6 +201,25 @@ def generate_mesh(
     print(f"  MESHER — Surface Reconstruction")
     print(f"{'='*60}")
 
+    # ── Point Cloud Spatial Smoothing (KD-Tree Clustering) ───────────────
+    if CLOUD_SMOOTH_ITERS > 0:
+        from scipy.spatial import cKDTree
+        print(f"\n  Smoothing point cloud directly (KD-Tree, {CLOUD_SMOOTH_ITERS} passes) …")
+        pts = np.asarray(pcd.points).copy()
+        inv_2sig2 = 1.0 / (2.0 * (CLOUD_SMOOTH_SIGMA ** 2))
+        
+        for it in range(CLOUD_SMOOTH_ITERS):
+            tree = cKDTree(pts)
+            # Find K neighbors (clusters) around each point
+            dists, indices = tree.query(pts, k=CLOUD_SMOOTH_K, workers=-1)
+            # Gaussian weighted average
+            weights = np.exp(-(dists ** 2) * inv_2sig2)
+            weights /= weights.sum(axis=1, keepdims=True)
+            pts = (weights[:, :, None] * pts[indices]).sum(axis=1)
+            
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        print(f"    Point cloud geometry seamlessly melted.")
+
     # ── Adaptive normal estimation ───────────────────────────────────────
     print("\n  Estimating normals (density-adaptive radius) …")
     nn_dists = np.asarray(pcd.compute_nearest_neighbor_distance())
@@ -204,25 +243,28 @@ def generate_mesh(
     # ── Density-based trimming ───────────────────────────────────────────
     print(f"  Density-based trimming …")
     density_arr = np.asarray(densities)
-    density_threshold = np.quantile(density_arr, 0.01)
+    density_threshold = np.quantile(density_arr, POISSON_DENSITY_QUANT)
     density_mask = density_arr < density_threshold
     mesh.remove_vertices_by_mask(density_mask)
     print(f"    Removed {density_mask.sum():,} low-density vertices")
 
-    # ── Distance-based Trimming ──────────────────────────────────────────
-    print(f"  Distance-based trimming (max dist={POISSON_TRIM_DISTANCE}) …")
-    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-    verts = np.asarray(mesh.vertices)
-    remove = np.zeros(len(verts), dtype=bool)
-    sq_thresh = POISSON_TRIM_DISTANCE ** 2
-
-    for i, v in enumerate(verts):
-        _, _, dists = pcd_tree.search_knn_vector_3d(v, 1)
-        if dists[0] > sq_thresh:
-            remove[i] = True
-
-    mesh.remove_vertices_by_mask(remove)
-    print(f"    Trimmed: {remove.sum():,} vertices removed")
+    # ── Connected Component Trimming ─────────────────────────────────────
+    print(f"  Connected component trimming (keeping ONLY largest component) …")
+    triangle_clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+    triangle_clusters = np.asarray(triangle_clusters)
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+    
+    if len(cluster_n_triangles) > 0:
+        largest_cluster_idx = np.argmax(cluster_n_triangles)
+        
+        # Mask to keep ONLY the triangles belonging to the largest cluster
+        triangles_to_remove = triangle_clusters != largest_cluster_idx
+        
+        mesh.remove_triangles_by_mask(triangles_to_remove)
+        mesh.remove_unreferenced_vertices()
+        components_removed = len(cluster_n_triangles) - 1
+        print(f"    Trimmed: {components_removed} disconnected phantom/internal shells removed")
+        
     print(f"    Result:  {len(mesh.vertices):,} verts, {len(mesh.triangles):,} tris")
 
     if output_dir:
@@ -258,6 +300,12 @@ def generate_mesh(
 
     if output_dir:
         o3d.io.write_triangle_mesh(str(output_dir / "mesh_filled.ply"), mesh)
+
+    # ── Surface Smoothing ────────────────────────────────────────────────
+    if RECON_SMOOTH_ITERS > 0:
+        print(f"\n  Smoothing mesh ({RECON_SMOOTH_ITERS} Taubin passes) …")
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=RECON_SMOOTH_ITERS)
+        mesh.compute_vertex_normals()
 
     # ── Vertex Color Transfer ────────────────────────────────────────────
     print("\n  Transferring vertex colors …")
