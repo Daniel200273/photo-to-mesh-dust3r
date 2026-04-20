@@ -2,6 +2,14 @@
 
 Generates textured 3D meshes from 10–15 photos using [DUSt3R](https://github.com/naver/dust3r. Runs on Mac, Windows, and Linux with auto GPU/CPU detection.
 
+| Point Cloud                          | Rough Mesh                         |
+| ------------------------------------ | ---------------------------------- |
+| ![Point Cloud](docs/point-cloud.png) | ![Rough Mesh](docs/rough-mesh.png) |
+
+| Stylized Mesh 1                              | Stylized Mesh 2                              |
+| -------------------------------------------- | -------------------------------------------- |
+| ![Stylized Mesh 1](docs/stylized-mesh-1.png) | ![Stylized Mesh 2](docs/stylized-mesh-2.png) |
+
 > **✨ Quick Start:** Want to get started immediately? Run `python src/studio.py` after completing the setup for an interactive CLI that guides you through the entire pipeline.
 
 ---
