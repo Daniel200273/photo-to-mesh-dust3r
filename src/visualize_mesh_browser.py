@@ -201,6 +201,7 @@ def visualize_mesh_plotly(
         "warm_stone": (0.27, 0.26, 0.23, 1.0),
         "soft_fog": (0.32, 0.34, 0.36, 1.0),
         "blue_mist": (0.16, 0.20, 0.24, 1.0),
+        "white": (1.0, 1.0, 1.0, 1.0),
     }
     bg_color_rgba = bg_map.get(bg_color.lower(), bg_map["studio_cool"])
     bg_css = _to_css_rgb(bg_color_rgba[:3])
@@ -371,7 +372,7 @@ if __name__ == "__main__":
         "--bg",
         type=str,
         default="studio_cool",
-        choices=["studio_cool", "neutral_slate", "warm_stone", "soft_fog", "blue_mist"],
+        choices=["studio_cool", "neutral_slate", "warm_stone", "soft_fog", "blue_mist", "white"],
         help="Background preset for object presentation",
     )
     parser.add_argument("--unlit", action="store_true", help="Use unlit appearance (hologram/material compatibility)")

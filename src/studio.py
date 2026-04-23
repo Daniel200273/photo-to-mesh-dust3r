@@ -87,8 +87,8 @@ def main():
     os.system('clear' if os.name == 'posix' else 'cls')
     
     console.print(Panel.fit(
-        "[bold magenta]✨ FewShot-NeRF Studio Wizard ✨[/bold magenta]\n"
-        "[dim]The simple, interactive 3D reconstruction pipeline.[/dim]",
+        "[bold magenta]Sparse-View Reconstruction Studio[/bold magenta]\n"
+        "[dim]Interactive interface for the 3D reconstruction pipeline.[/dim]",
         border_style="magenta"
     ))
     
@@ -260,7 +260,8 @@ def main():
             console.print("  3. warm_stone    (Complements cool-colored assets)")
             console.print("  4. soft_fog      (Gentle low-fatigue backdrop)")
             console.print("  5. blue_mist     (Great for hologram/cyan accents)")
-            bg_sel = Prompt.ask("Choose theme [1-5]", choices=["1","2","3","4","5"], default="1")
+            console.print("  6. white         (Clean publication/presentation background)")
+            bg_sel = Prompt.ask("Choose theme [1-6]", choices=["1","2","3","4","5","6"], default="1")
 
             themes = {
                 "1": "studio_cool",
@@ -268,6 +269,7 @@ def main():
                 "3": "warm_stone",
                 "4": "soft_fog",
                 "5": "blue_mist",
+                "6": "white",
             }
             current_bg = themes[bg_sel]
             console.print(f"[dim]  → Viewer background set to {current_bg}.[/dim]")

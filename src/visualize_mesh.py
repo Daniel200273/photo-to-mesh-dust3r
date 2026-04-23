@@ -177,6 +177,7 @@ def visualize_mesh(mesh_path: Path, hologram: bool = False, pedestal_path: str =
         "warm_stone": (0.27, 0.26, 0.23, 1.0),      # Complements cool-colored assets
         "soft_fog": (0.32, 0.34, 0.36, 1.0),        # Gentle, low-fatigue backdrop
         "blue_mist": (0.16, 0.20, 0.24, 1.0),       # Great for hologram/cyan accents
+        "white": (1.0, 1.0, 1.0, 1.0),              # Clean publication/presentation background
     }
     bg_color_rgba = bg_map.get(bg_color.lower(), bg_map["studio_cool"])
 
@@ -300,7 +301,7 @@ if __name__ == "__main__":
         "--bg",
         type=str,
         default="studio_cool",
-        choices=["studio_cool", "neutral_slate", "warm_stone", "soft_fog", "blue_mist"],
+        choices=["studio_cool", "neutral_slate", "warm_stone", "soft_fog", "blue_mist", "white"],
         help="Background preset for object presentation",
     )
     parser.add_argument("--unlit", action="store_true", help="Disable Open3D default glossy lighting (used for pre-baked materials)")

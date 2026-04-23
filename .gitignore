@@ -4,3 +4,4 @@ data/*
 dust3r/
 *.DS_Store
 !data/processed_data/
+data/processed_data/checkpoints

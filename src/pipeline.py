@@ -36,6 +36,23 @@ def has_images(directory: Path) -> bool:
     return any(f.suffix.lower() in VALID_EXTENSIONS for f in directory.iterdir() if f.is_file())
 
 
+def save_point_cloud_checkpoint(
+    checkpoint_dir: Path,
+    filename: str,
+    points: np.ndarray,
+    colors: np.ndarray,
+):
+    """Save a point cloud checkpoint to the dedicated checkpoints directory."""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / filename
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    o3d.io.write_point_cloud(str(checkpoint_path), pcd)
+    print(f"  ↳ checkpoint saved: {checkpoint_path}")
+
+
 def load_model():
     """Detect hardware and load the DUSt3R model (done once, reused across passes)."""
     print("--- Hardware Detection & Loading Model ---")
@@ -70,7 +87,14 @@ def load_model():
     return model, device
 
 
-def run_dust3r(raw_data_dir: Path, output_dir: Path, model, device, output_name: str = "reconstruction.ply"):
+def run_dust3r(
+    raw_data_dir: Path,
+    output_dir: Path,
+    model,
+    device,
+    output_name: str = "reconstruction.ply",
+    checkpoint_dir: Path | None = None,
+):
     """
     Run DUSt3R on a set of images and export a coloured point cloud.
 
@@ -117,6 +141,26 @@ def run_dust3r(raw_data_dir: Path, output_dir: Path, model, device, output_name:
     all_pts = np.concatenate(all_pts, axis=0)
     all_colors = np.concatenate(all_colors, axis=0)
 
+    if checkpoint_dir is not None:
+        print("--- Saving DUSt3R Checkpoints ---")
+        for i in range(len(imgs)):
+            p = pts3d[i].detach().cpu().numpy() if hasattr(pts3d[i], 'detach') else pts3d[i]
+            c = imgs[i].detach().cpu().numpy() if hasattr(imgs[i], 'detach') else imgs[i]
+            m = masks[i].detach().cpu().numpy() if hasattr(masks[i], 'detach') else masks[i]
+            save_point_cloud_checkpoint(
+                checkpoint_dir,
+                f"dust3r_00_view_{i + 1:03d}.ply",
+                p[m],
+                c[m],
+            )
+
+        save_point_cloud_checkpoint(
+            checkpoint_dir,
+            "dust3r_01_fused_aligned.ply",
+            all_pts,
+            all_colors,
+        )
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(all_pts)
     pcd.colors = o3d.utility.Vector3dVector(all_colors)
@@ -129,6 +173,7 @@ if __name__ == "__main__":
     project_root = Path(__file__).parent.parent.resolve()
     raw_dir    = project_root / "data" / "raw_data"
     processed_dir  = project_root / "data" / "processed_data"
+    checkpoints_dir = processed_dir / "checkpoints"
 
     if not has_images(raw_dir):
         print(f"Error: No images found in {raw_dir}")
@@ -141,7 +186,14 @@ if __name__ == "__main__":
     print("  3D Reconstruction — (raw_data)")
     print("=" * 60)
     normalize_images(raw_dir)
-    run_dust3r(raw_dir, processed_dir, model, device, output_name="reconstruction.ply")
+    run_dust3r(
+        raw_dir,
+        processed_dir,
+        model,
+        device,
+        output_name="reconstruction.ply",
+        checkpoint_dir=checkpoints_dir / "dust3r",
+    )
 
     print("\n✅ Done! Run mesh_reconstruction.py to generate the final mesh:")
     print("   python src/mesh_reconstruction.py")

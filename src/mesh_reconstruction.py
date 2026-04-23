@@ -69,7 +69,7 @@ PEDESTAL_COLOR_SAMPLES = 64     # bottom-edge vertices to sample for colour matc
 def clean_cloud(
     pcd: o3d.geometry.PointCloud,
     label: str = "scan",
-    output_dir: Path | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> tuple[o3d.geometry.PointCloud, tuple[float, float, float, float] | None]:
     """
     Full cleansing pipeline for a single raw point cloud.
@@ -82,8 +82,8 @@ def clean_cloud(
     Returns: cleaned point cloud containing only the target object.
     """
     save_dir = None
-    if output_dir is not None:
-        save_dir = output_dir / label
+    if checkpoint_dir is not None:
+        save_dir = checkpoint_dir / label
         save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
@@ -183,7 +183,7 @@ def clean_cloud(
 def generate_mesh(
     pcd: o3d.geometry.PointCloud,
     colored_pcd: o3d.geometry.PointCloud | None = None,
-    output_dir: Path | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> o3d.geometry.TriangleMesh:
     """
     Full meshing pipeline: Poisson reconstruction → density/distance trim →
@@ -240,6 +240,10 @@ def generate_mesh(
     )
     print(f"    Raw: {len(mesh.vertices):,} verts, {len(mesh.triangles):,} tris")
 
+    if checkpoint_dir:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        o3d.io.write_triangle_mesh(str(checkpoint_dir / "10_poisson_raw.ply"), mesh)
+
     # ── Density-based trimming ───────────────────────────────────────────
     print(f"  Density-based trimming …")
     density_arr = np.asarray(densities)
@@ -267,8 +271,8 @@ def generate_mesh(
         
     print(f"    Result:  {len(mesh.vertices):,} verts, {len(mesh.triangles):,} tris")
 
-    if output_dir:
-        o3d.io.write_triangle_mesh(str(output_dir / "mesh_trimmed.ply"), mesh)
+    if checkpoint_dir:
+        o3d.io.write_triangle_mesh(str(checkpoint_dir / "11_mesh_trimmed.ply"), mesh)
 
     # ── Hole Filling ─────────────────────────────────────────────────────
     print("\n  Filling holes …")
@@ -298,8 +302,8 @@ def generate_mesh(
             all_colors = vc_before[:n_new]
         mesh.vertex_colors = o3d.utility.Vector3dVector(all_colors)
 
-    if output_dir:
-        o3d.io.write_triangle_mesh(str(output_dir / "mesh_filled.ply"), mesh)
+    if checkpoint_dir:
+        o3d.io.write_triangle_mesh(str(checkpoint_dir / "12_mesh_filled.ply"), mesh)
 
     # ── Surface Smoothing ────────────────────────────────────────────────
     if RECON_SMOOTH_ITERS > 0:
@@ -322,6 +326,9 @@ def generate_mesh(
     mesh.compute_vertex_normals()
     print(f"    Coloured {len(mesh_verts):,} vertices ✅")
 
+    if checkpoint_dir:
+        o3d.io.write_triangle_mesh(str(checkpoint_dir / "13_mesh_colored.ply"), mesh)
+
     return mesh
 
 
@@ -330,7 +337,8 @@ def generate_mesh(
 def generate_pedestal(
     mesh: o3d.geometry.TriangleMesh,
     plane_model: tuple | None = None,
-    output_dir: Path | None = None,
+    checkpoint_dir: Path | None = None,
+    pedestal_output_path: Path | None = None,
 ) -> o3d.geometry.TriangleMesh:
     """
     Generate a flat circular pedestal and attach it below the object.
@@ -449,8 +457,13 @@ def generate_pedestal(
     pedestal_mesh.compute_vertex_normals()
     print(f"  Pedestal: {len(disc_verts):,} verts, {len(disc_faces):,} tris")
 
-    if output_dir:
-        o3d.io.write_triangle_mesh(str(output_dir / "pedestal.ply"), pedestal_mesh)
+    if checkpoint_dir:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        o3d.io.write_triangle_mesh(str(checkpoint_dir / "20_pedestal_only.ply"), pedestal_mesh)
+
+    if pedestal_output_path is not None:
+        pedestal_output_path.parent.mkdir(parents=True, exist_ok=True)
+        o3d.io.write_triangle_mesh(str(pedestal_output_path), pedestal_mesh)
 
     combined = mesh + pedestal_mesh
     combined.compute_vertex_normals()
@@ -463,21 +476,34 @@ def generate_pedestal(
 def run_pipeline(input_ply: Path, output_dir: Path):
     """Single-scan pipeline: clean → mesh → pedestal."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_root = output_dir.parent / "checkpoints"
+    mesh_checkpoint_dir = checkpoint_root / "mesh_reconstruction"
+    mesh_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     pcd = o3d.io.read_point_cloud(str(input_ply))
     if pcd.is_empty():
         raise RuntimeError(f"Empty point cloud: {input_ply}")
     print(f"📂 Loaded {len(pcd.points):,} points from {input_ply}")
+    o3d.io.write_point_cloud(str(mesh_checkpoint_dir / "00_input_point_cloud.ply"), pcd)
 
-    pcd_clean, plane_model = clean_cloud(pcd, label="scan", output_dir=output_dir)
-    mesh = generate_mesh(pcd_clean, colored_pcd=pcd_clean, output_dir=output_dir)
+    pcd_clean, plane_model = clean_cloud(pcd, label="scan", checkpoint_dir=mesh_checkpoint_dir)
+    o3d.io.write_point_cloud(str(mesh_checkpoint_dir / "04_cleaned_object_point_cloud.ply"), pcd_clean)
+
+    mesh = generate_mesh(pcd_clean, colored_pcd=pcd_clean, checkpoint_dir=mesh_checkpoint_dir)
 
     # Save object-only mesh — used by stylize.py so the pedestal stays unstyled
     object_path = output_dir / "object_mesh.ply"
     o3d.io.write_triangle_mesh(str(object_path), mesh)
+    o3d.io.write_triangle_mesh(str(mesh_checkpoint_dir / "14_object_mesh.ply"), mesh)
     print(f"  Object mesh saved to {object_path}")
 
-    mesh = generate_pedestal(mesh, plane_model=plane_model, output_dir=output_dir)
+    mesh = generate_pedestal(
+        mesh,
+        plane_model=plane_model,
+        checkpoint_dir=mesh_checkpoint_dir,
+        pedestal_output_path=output_dir / "pedestal.ply",
+    )
+    o3d.io.write_triangle_mesh(str(mesh_checkpoint_dir / "21_mesh_with_pedestal.ply"), mesh)
 
     final_path = output_dir / "final_mesh.ply"
     o3d.io.write_triangle_mesh(str(final_path), mesh)
