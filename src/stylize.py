@@ -34,11 +34,13 @@ VOXEL_SIZE_DEFAULT        = 0.01           # Default voxel cube size
 VOXEL_SAMPLE_DENSITY      = 2.0            # Multiplier for point sampling
 VOXEL_MAX_CUBES           = 200000         # Safety cap to avoid native Open3D crashes
 VOXEL_MAX_TRIANGLES       = 3000000        # Safe write threshold for voxel meshes
+VOXEL_COLOR_KNN           = 1              # Nearest-neighbour color transfer keeps voxel colors crisp
 
 # SOFT-VOXEL Filter
 SOFT_VOXEL_SIZE_DEFAULT   = 0.01           # Default soft voxel size
 SOFT_VOXEL_SPHERE_RADIUS_MULT = 0.6       # Sphere radius = voxel_size * this
 SOFT_VOXEL_MAX_NODES      = 150000         # Safety cap for sphere node count
+SOFT_VOXEL_COLOR_KNN      = 1              # Reproject colors from source cloud to avoid muddy voxel averages
 
 # HOLOGRAM Filter
 HOLOGRAM_TARGET_TRIANGLES = 2000           # Target tris for low-poly base
@@ -50,6 +52,7 @@ HOLOGRAM_HOLE_CLOSE_MAX_TRIANGLES = 250000  # Auto-repair body holes below this 
 FF7_TARGET_TRIANGLES      = 800            # Very low poly (PS1 character range)
 FF7_COLOR_LEVELS          = 16             # Colour quantization steps per channel
                                            # (PS1 = 32 levels / 5-bit, 16 = more stylised)
+LOW_POLY_COLOR_KNN        = 1              # Nearest-neighbour colour transfer for crisp low-poly albedo
 # ═══════════════════════════ FILTERS ═════════════════════════════════════════
 
 def decouple_geometry(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
@@ -235,6 +238,11 @@ def apply_low_poly(
 
     print(f"Applying low-poly filter (target: {target_triangles} tris)...")
 
+    has_colors = len(mesh.vertex_colors) > 0
+    if has_colors:
+        src_pts = np.asarray(mesh.vertices).copy()
+        src_cols = np.asarray(mesh.vertex_colors).copy()
+
     # Clean
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_vertices()
@@ -298,6 +306,19 @@ def apply_low_poly(
     print("  → Decoupling facets for True Flat Shading...")
     mesh_simplified = decouple_geometry(mesh_simplified)
 
+    if has_colors:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(src_pts)
+        dst_pts = np.asarray(mesh_simplified.vertices)
+        if LOW_POLY_COLOR_KNN <= 1:
+            _, idx = tree.query(dst_pts, workers=-1)
+            recolored = src_cols[idx]
+        else:
+            _, idx = tree.query(dst_pts, k=LOW_POLY_COLOR_KNN, workers=-1)
+            recolored = src_cols[idx].mean(axis=1)
+        mesh_simplified.vertex_colors = o3d.utility.Vector3dVector(np.clip(recolored, 0.0, 1.0))
+        print("  → Reprojected colors from source mesh for sharper texture detail")
+
     print(f"  ✓ Result: {len(mesh_simplified.vertices):,} verts, {len(mesh_simplified.triangles):,} tris")
     return mesh_simplified
 
@@ -323,6 +344,8 @@ def apply_voxel(
     num_samples = max(int(len(mesh_work.vertices) * VOXEL_SAMPLE_DENSITY), 200000)
     print(f"  → Sampling {num_samples:,} points...")
     pcd = mesh_work.sample_points_uniformly(number_of_points=num_samples)
+    sample_pts = np.asarray(pcd.points)
+    sample_cols = np.asarray(pcd.colors)
 
     # Create voxel grid
     print(f"  → Creating voxel grid...")
@@ -336,15 +359,27 @@ def apply_voxel(
             "Increase voxel size (recommended >= 0.003)."
         )
 
+    centers = np.asarray([voxel_grid.get_voxel_center_coordinate(v.grid_index) for v in voxels])
+    voxel_cols = np.asarray([v.color for v in voxels], dtype=np.float64)
+    if len(centers) > 0 and len(sample_pts) > 0 and len(sample_cols) == len(sample_pts):
+        from scipy.spatial import cKDTree
+        tree = cKDTree(sample_pts)
+        if VOXEL_COLOR_KNN <= 1:
+            _, idx = tree.query(centers, workers=-1)
+            voxel_cols = sample_cols[idx]
+        else:
+            _, idx = tree.query(centers, k=VOXEL_COLOR_KNN, workers=-1)
+            voxel_cols = sample_cols[idx].mean(axis=1)
+        voxel_cols = np.clip(voxel_cols, 0.0, 1.0)
+
     # Reconstruct mesh from voxels
     voxel_mesh = o3d.geometry.TriangleMesh()
-    for v in voxels:
-        center = voxel_grid.get_voxel_center_coordinate(v.grid_index)
+    for center, col in zip(centers, voxel_cols):
         cube = o3d.geometry.TriangleMesh.create_box(
             width=voxel_size, height=voxel_size, depth=voxel_size
         )
         cube.translate(center - np.array([voxel_size/2, voxel_size/2, voxel_size/2]))
-        cube.paint_uniform_color(v.color)
+        cube.paint_uniform_color(col)
         voxel_mesh += cube
 
     if len(voxels) == 0:
@@ -382,7 +417,20 @@ def apply_soft_voxel(
     pcd_down = pcd.voxel_down_sample(voxel_size=voxel_size)
 
     points = np.asarray(pcd_down.points)
-    colors = np.asarray(pcd_down.colors)
+    sample_pts = np.asarray(pcd.points)
+    sample_cols = np.asarray(pcd.colors)
+    if len(points) > 0 and len(sample_pts) > 0 and len(sample_cols) == len(sample_pts):
+        from scipy.spatial import cKDTree
+        tree = cKDTree(sample_pts)
+        if SOFT_VOXEL_COLOR_KNN <= 1:
+            _, idx = tree.query(points, workers=-1)
+            colors = sample_cols[idx]
+        else:
+            _, idx = tree.query(points, k=SOFT_VOXEL_COLOR_KNN, workers=-1)
+            colors = sample_cols[idx].mean(axis=1)
+        colors = np.clip(colors, 0.0, 1.0)
+    else:
+        colors = np.asarray(pcd_down.colors)
     sphere_radius = voxel_size * SOFT_VOXEL_SPHERE_RADIUS_MULT
 
     if len(points) > SOFT_VOXEL_MAX_NODES:
@@ -818,7 +866,7 @@ def apply_material(
     voxel_like = _is_voxel_like_mesh(mesh)
     preserve = preserve_geometry or voxel_like
     if preserve_geometry:
-        print("  → Preserve-geometry mode enabled: skipping smoothing/subdivision")
+        print("  → Preserve-geometry mode enabled: skipping smoothing")
     
     if original_verts > 150000 and not preserve:
         # High resolution organic NeRF meshes contain millions of microscopic surface bumps.
@@ -827,19 +875,28 @@ def apply_material(
         mesh = mesh.filter_smooth_taubin(number_of_iterations=5)
     elif original_verts > 150000 and preserve:
         print("  → Voxel-like mesh detected: skipping smoothing to preserve block structure")
+
+    if texture_path and Path(texture_path).exists() and voxel_like:
+        # Make each triangle independent so corner-normal averaging cannot blur
+        # triplanar weights on blocky voxel edges.
+        print("  → Voxel mesh detected: decoupling faces for sharper material projection...")
+        mesh = decouple_geometry(mesh)
         
     if texture_path and Path(texture_path).exists():
         # High-res textures require high vertex density because we bake into vertex_colors.
         # If the mesh is low-poly, it physically lacks the "pixels" to show the image details!
         # subdivide_midpoint adds vertices but strictly preserves flat, blocky geometry!
         TARGET_MIN_VERTS = 150000
-        if len(mesh.vertices) < TARGET_MIN_VERTS and not preserve:
-            print(f"  → Low vertex count detected. Subdividing geometry to increase texture resolution...")
-            while len(mesh.vertices) < TARGET_MIN_VERTS:
+        if len(mesh.vertices) < TARGET_MIN_VERTS:
+            if preserve:
+                print("  → Midpoint subdivision for denser texture sampling (shape preserved)...")
+            else:
+                print("  → Low vertex count detected. Subdividing geometry to increase texture resolution...")
+            subdiv_iters = 0
+            while len(mesh.vertices) < TARGET_MIN_VERTS and subdiv_iters < 3:
                 mesh = mesh.subdivide_midpoint(number_of_iterations=1)
-            print(f"  → Geometry boosted to {len(mesh.vertices)} vertices for crisp textures!")
-        elif preserve:
-            print("  → Voxel-like mesh detected: skipping auto-subdivision")
+                subdiv_iters += 1
+            print(f"  → Geometry boosted to {len(mesh.vertices)} vertices for crisper textures")
 
     pts = np.asarray(mesh.vertices)
     mesh.compute_vertex_normals()
@@ -862,10 +919,16 @@ def apply_material(
             if img_arr.size == 0:
                 raise ValueError("Image empty")
                 
-            # Drastically bump sharpness (exponent 16) to prevent textures from blending/blurring 
-            # into a muddy mess on diagonal surfaces.
-            weights = np.abs(normals) ** 16.0
-            weights /= np.maximum(np.sum(weights, axis=1, keepdims=True), 1e-8)
+            if voxel_like:
+                # Hard axis selection keeps block faces crisp and avoids triplanar haze.
+                weights = np.zeros_like(normals)
+                dominant = np.argmax(np.abs(normals), axis=1)
+                weights[np.arange(len(normals)), dominant] = 1.0
+            else:
+                # Drastically bump sharpness (exponent 16) to prevent textures from blending/blurring 
+                # into a muddy mess on diagonal surfaces.
+                weights = np.abs(normals) ** 16.0
+                weights /= np.maximum(np.sum(weights, axis=1, keepdims=True), 1e-8)
             
             # Use normalized coordinates so scale=1.0 means exactly 1 repetition across the object
             uv_x = pts_n[:, [2, 1]] * scale
